@@ -27,11 +27,19 @@ impl PDFSigningDocument {
 
         // This code assumes that the objects in Kids are References.
         // Get list of `Kids` ObjectIDs
-        let form_dict = self
-            .raw_document
-            .get_prev_documents()
-            .get_object(signature_obj_id)?
-            .as_dict()?;
+        // Try to read the signature field from previous documents first; if not present (for example
+        // when tests or code created the field in the new incremental document), fall back to the
+        // new_document.
+        let form_dict = match self.raw_document.get_prev_documents().get_object(signature_obj_id) {
+            Ok(obj) => obj.as_dict()?,
+            Err(_) => {
+                // Fallback: try the new incremental document where tests may have created the field.
+                self.raw_document
+                    .new_document
+                    .get_object(signature_obj_id)?
+                    .as_dict()?
+            }
+        };
         let kids = if form_dict.has(b"Kids") {
             Some(form_dict.get(b"Kids")?.as_array()?)
         } else {
@@ -58,11 +66,16 @@ impl PDFSigningDocument {
         // Loop over Kids that are `Annot`.
         let mut found_and_replace_appearance = false;
         for child_obj_id in kids {
-            let child_dict = self
-                .raw_document
-                .get_prev_documents()
-                .get_object(child_obj_id)?
-                .as_dict()?;
+            let child_dict = match self.raw_document.get_prev_documents().get_object(child_obj_id) {
+                Ok(obj) => obj.as_dict()?,
+                Err(_) => {
+                    // If the child was created in the new incremental document, read it from there.
+                    self.raw_document
+                        .new_document
+                        .get_object(child_obj_id)?
+                        .as_dict()?
+                }
+            };
 
             if child_dict.get(b"Type")?.as_name_str()? == "Annot" {
                 // Copy child to new incremental update

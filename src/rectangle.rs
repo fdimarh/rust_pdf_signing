@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Rectangle {
     pub x1: f64,
     pub y1: f64,

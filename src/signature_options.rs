@@ -1,3 +1,5 @@
+use crate::rectangle::Rectangle;
+
 #[derive(Clone)]
 pub enum SignatureFormat {
     PKCS7,
@@ -15,6 +17,14 @@ pub struct SignatureOptions {
     // Pkcs7-specific
     pub signed_attribute_include_crl: bool,
     pub signed_attribute_include_ocsp: bool,
+
+    /// 1-based page number on which the visible signature image should be placed.
+    /// `None` means the signature widget is placed on the first page (default).
+    pub signature_page: Option<u32>,
+
+    /// Rectangle that defines the position and size of the visible signature
+    /// image on the selected page.  `None` means a sensible default is used.
+    pub signature_rect: Option<Rectangle>,
 }
 
 impl Default for SignatureOptions {
@@ -28,6 +38,9 @@ impl Default for SignatureOptions {
 
             signed_attribute_include_crl: true,
             signed_attribute_include_ocsp: false,
+
+            signature_page: None,
+            signature_rect: None,
         }
     }
 }

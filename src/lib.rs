@@ -8,10 +8,12 @@ mod image_xobject;
 mod lopdf_utils;
 mod ltv;
 mod pdf_object;
-mod rectangle;
+pub mod rectangle;
 mod signature_image;
 mod signature_info;
+mod signature_placeholder;
 pub mod signature_options;
+pub mod signature_validator;
 mod user_signature_info;
 
 use acro_form::AcroForm;
@@ -28,6 +30,7 @@ use std::{fs::File, path::Path};
 
 pub use error::Error;
 pub use lopdf;
+pub use rectangle::Rectangle;
 pub use signature_options::SignatureOptions;
 pub use user_signature_info::{UserFormSignatureInfo, UserSignatureInfo};
 
@@ -217,6 +220,186 @@ impl PDFSigningDocument {
                 Ok(self.raw_document.get_prev_documents_bytes().to_vec())
             }
         }
+    }
+
+    /// Digitally sign a PDF that does **not** contain a pre-existing empty signature
+    /// placeholder.  A new signature field, widget annotation, and visible signature
+    /// image are created from scratch and placed on the page selected by
+    /// `signature_options.signature_page` (defaults to page 1).
+    ///
+    /// The position / size of the visible signature is controlled by
+    /// `signature_options.signature_rect`.
+    pub fn sign_document_no_placeholder(
+        &mut self,
+        user_info: &UserSignatureInfo,
+        signature_options: &SignatureOptions,
+    ) -> Result<Vec<u8>, Error> {
+        use crate::signature_placeholder::{
+            build_signature_v_dictionary, find_page_object_id,
+        };
+        use lopdf::Object::{Array, Name, Reference};
+        use lopdf::StringFormat;
+        use std::io::Cursor;
+
+        self.raw_document.new_document.version = "1.5".parse().unwrap();
+
+        let prev = self.get_prev_document_ref();
+        let root_id = prev.trailer.get(b"Root")?.as_reference()?;
+
+        // Check whether AcroForm already exists
+        let acroform_opt: Option<ObjectId> = {
+            let root_prev = prev.get_object(root_id)?.as_dict()?;
+            if root_prev.has(b"AcroForm") {
+                Some(root_prev.get(b"AcroForm")?.as_reference()?)
+            } else {
+                None
+            }
+        };
+
+        // Clone Root into new incremental update
+        self.raw_document.opt_clone_object_to_new_document(root_id)?;
+
+        // Generate a human-readable field name with a random number
+        let field_name = format!("Signature{}", rand::random::<u32>());
+
+        // --- Create signature field (FT=Sig) ---
+        let sig_field_dict = lopdf::Dictionary::from_iter(vec![
+            ("FT", Object::Name(b"Sig".to_vec())),
+            ("T", Object::String(field_name.into_bytes(), StringFormat::Literal)),
+        ]);
+        let sig_field_id = self.raw_document.new_document.add_object(
+            Object::Dictionary(sig_field_dict),
+        );
+
+        // --- Attach field to AcroForm ---
+        match acroform_opt {
+            Some(acro_id) => {
+                self.raw_document.opt_clone_object_to_new_document(acro_id)?;
+                let acro_mut = self.raw_document.new_document
+                    .get_object_mut(acro_id)?.as_dict_mut()?;
+                if acro_mut.has(b"Fields") {
+                    let mut new_fields = acro_mut.get(b"Fields")?.as_array()?.clone();
+                    new_fields.push(Reference(sig_field_id));
+                    acro_mut.set("Fields", Object::Array(new_fields));
+                } else {
+                    acro_mut.set("Fields", Array(vec![Reference(sig_field_id)]));
+                }
+            }
+            None => {
+                let new_acro = lopdf::Dictionary::from_iter(vec![
+                    ("Fields", Array(vec![Reference(sig_field_id)])),
+                ]);
+                let new_acro_id = self.raw_document.new_document.add_object(
+                    Object::Dictionary(new_acro),
+                );
+                let root_mut = self.raw_document.new_document
+                    .get_object_mut(root_id)?.as_dict_mut()?;
+                root_mut.set("AcroForm", Reference(new_acro_id));
+            }
+        }
+
+        // --- Resolve target page and rectangle ---
+        let rect = signature_options.signature_rect
+            .unwrap_or(rectangle::Rectangle { x1: 50.0, y1: 50.0, x2: 250.0, y2: 100.0 });
+
+        let target_page_ref = {
+            let prev_doc = self.get_prev_document_ref();
+            find_page_object_id(prev_doc, signature_options.signature_page)?
+        };
+
+        // --- Create appearance XObject from signature image ---
+        let image_name = format!("UserSignature{}", user_info.user_id);
+        let image_object_id = self.add_image_as_form_xobject(
+            Cursor::new(&user_info.user_signature),
+            &image_name,
+            rect,
+        )?;
+
+        // --- Create widget annotation ---
+        let widget_dict = lopdf::Dictionary::from_iter(vec![
+            ("Type", Name("Annot".as_bytes().to_vec())),
+            ("Subtype", Name("Widget".as_bytes().to_vec())),
+            ("Rect", Array(vec![
+                (rect.x1 as i32).into(),
+                (rect.y1 as i32).into(),
+                (rect.x2 as i32).into(),
+                (rect.y2 as i32).into(),
+            ])),
+            ("AP", Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+                ("N", Reference(image_object_id)),
+            ]))),
+        ]);
+        let widget_id = self.raw_document.new_document.add_object(
+            Object::Dictionary(widget_dict),
+        );
+
+        // --- Clone target page and merge Resources ---
+        self.raw_document.opt_clone_object_to_new_document(target_page_ref)?;
+
+        let merged_resources = {
+            let prev_doc = self.get_prev_document_ref();
+            let page_dict = prev_doc.get_object(target_page_ref)?.as_dict()?;
+
+            let mut res_dict = if page_dict.has(b"Resources") {
+                match page_dict.get(b"Resources")? {
+                    Object::Dictionary(d) => d.clone(),
+                    Object::Reference(r) => prev_doc.get_object(*r)?.as_dict()?.clone(),
+                    _ => lopdf::Dictionary::new(),
+                }
+            } else {
+                lopdf::Dictionary::new()
+            };
+
+            let mut xobj_sub = if res_dict.has(b"XObject") {
+                match res_dict.get(b"XObject")? {
+                    Object::Dictionary(d) => d.clone(),
+                    Object::Reference(r) => prev_doc.get_object(*r)?.as_dict()?.clone(),
+                    _ => lopdf::Dictionary::new(),
+                }
+            } else {
+                lopdf::Dictionary::new()
+            };
+
+            xobj_sub.set(image_name.as_bytes().to_vec(), Reference(image_object_id));
+            res_dict.set("XObject", Object::Dictionary(xobj_sub));
+            Object::Dictionary(res_dict)
+        };
+
+        // Set Resources and Annots on the target page
+        let page_mut = self.raw_document.new_document
+            .get_object_mut(target_page_ref)?.as_dict_mut()?;
+        page_mut.set("Resources", merged_resources);
+
+        let new_annots = if page_mut.has(b"Annots") {
+            let mut arr = page_mut.get(b"Annots")?.as_array()?.clone();
+            arr.push(Reference(widget_id));
+            Array(arr)
+        } else {
+            Array(vec![Reference(widget_id)])
+        };
+        page_mut.set("Annots", new_annots);
+
+        // --- Create and attach V dictionary ---
+        let v_obj = build_signature_v_dictionary(user_info, signature_options);
+        let v_ref = self.raw_document.new_document.add_object(v_obj);
+
+        {
+            let field_mut = self.raw_document.new_document
+                .get_object_mut(sig_field_id)?.as_dict_mut()?;
+            field_mut.set("Kids", Array(vec![Reference(widget_id)]));
+            field_mut.set("V", Reference(v_ref));
+        }
+        {
+            let widget_mut = self.raw_document.new_document
+                .get_object_mut(widget_id)?.as_dict_mut()?;
+            widget_mut.set("P", Reference(target_page_ref));
+            widget_mut.set("Parent", Reference(sig_field_id));
+        }
+
+        // --- Perform cryptographic signing ---
+        let signed_pdf = self.digitally_sign_document(user_info, signature_options)?;
+
+        Ok(signed_pdf)
     }
 
     // pub fn add_signature_to_form<R: Read>(
