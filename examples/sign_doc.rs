@@ -39,6 +39,9 @@ fn main() {
         x2: 250.0,
         y2: 100.0,
     });
+    // Set to `false` for an invisible (cryptography-only) digital signature
+    // with no image rendered on the page.
+    opts.visible_signature = true;
 
     // ── Sign ──
     let mut pdf_signing_document =

@@ -262,16 +262,144 @@ impl PDFSigningDocument {
         // Generate a human-readable field name with a random number
         let field_name = format!("Signature{}", rand::random::<u32>());
 
-        // --- Create signature field (FT=Sig) ---
-        let sig_field_dict = lopdf::Dictionary::from_iter(vec![
-            ("FT", Object::Name(b"Sig".to_vec())),
-            ("T", Object::String(field_name.into_bytes(), StringFormat::Literal)),
-        ]);
-        let sig_field_id = self.raw_document.new_document.add_object(
-            Object::Dictionary(sig_field_dict),
-        );
+        // --- Resolve target page ---
+        let target_page_ref = {
+            let prev_doc = self.get_prev_document_ref();
+            find_page_object_id(prev_doc, signature_options.signature_page)?
+        };
 
-        // --- Attach field to AcroForm ---
+        // --- Build V (signature value) dictionary ---
+        let v_obj = build_signature_v_dictionary(user_info, signature_options);
+        let v_ref = self.raw_document.new_document.add_object(v_obj);
+
+        // --- Build merged field-widget dictionary ---
+        // Per PDF spec (ISO 32000-1 §12.7.3.1), a field dictionary and a
+        // widget annotation can be merged into a single object.  This is the
+        // format that Adobe Reader, Foxit, and most viewers expect.
+        let sig_field_id = if signature_options.visible_signature {
+            // ── Visible signature: image XObject + appearance ──
+            let rect = signature_options.signature_rect
+                .unwrap_or(rectangle::Rectangle { x1: 50.0, y1: 50.0, x2: 250.0, y2: 100.0 });
+
+            let image_name = format!("UserSignature{}", user_info.user_id);
+            let image_object_id = self.add_image_as_form_xobject(
+                Cursor::new(&user_info.user_signature),
+                &image_name,
+                rect,
+            )?;
+
+            let merged_dict = lopdf::Dictionary::from_iter(vec![
+                // -- Field entries --
+                ("FT", Name(b"Sig".to_vec())),
+                ("T", Object::String(field_name.into_bytes(), StringFormat::Literal)),
+                ("V", Reference(v_ref)),
+                // -- Widget annotation entries --
+                ("Type", Name(b"Annot".to_vec())),
+                ("Subtype", Name(b"Widget".to_vec())),
+                ("Rect", Array(vec![
+                    (rect.x1 as i32).into(),
+                    (rect.y1 as i32).into(),
+                    (rect.x2 as i32).into(),
+                    (rect.y2 as i32).into(),
+                ])),
+                ("P", Reference(target_page_ref)),
+                ("AP", Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+                    ("N", Reference(image_object_id)),
+                ]))),
+                // F = 4 (Print flag) — visible on screen and in print
+                ("F", Object::Integer(4)),
+            ]);
+            let fid = self.raw_document.new_document.add_object(
+                Object::Dictionary(merged_dict),
+            );
+
+            // Clone target page and merge image XObject into Resources
+            self.raw_document.opt_clone_object_to_new_document(target_page_ref)?;
+
+            let merged_resources = {
+                let prev_doc = self.get_prev_document_ref();
+                let page_dict = prev_doc.get_object(target_page_ref)?.as_dict()?;
+
+                let mut res_dict = if page_dict.has(b"Resources") {
+                    match page_dict.get(b"Resources")? {
+                        Object::Dictionary(d) => d.clone(),
+                        Object::Reference(r) => prev_doc.get_object(*r)?.as_dict()?.clone(),
+                        _ => lopdf::Dictionary::new(),
+                    }
+                } else {
+                    lopdf::Dictionary::new()
+                };
+
+                let mut xobj_sub = if res_dict.has(b"XObject") {
+                    match res_dict.get(b"XObject")? {
+                        Object::Dictionary(d) => d.clone(),
+                        Object::Reference(r) => prev_doc.get_object(*r)?.as_dict()?.clone(),
+                        _ => lopdf::Dictionary::new(),
+                    }
+                } else {
+                    lopdf::Dictionary::new()
+                };
+
+                xobj_sub.set(image_name.as_bytes().to_vec(), Reference(image_object_id));
+                res_dict.set("XObject", Object::Dictionary(xobj_sub));
+                Object::Dictionary(res_dict)
+            };
+
+            let page_mut = self.raw_document.new_document
+                .get_object_mut(target_page_ref)?.as_dict_mut()?;
+            page_mut.set("Resources", merged_resources);
+
+            // Add to page Annots
+            let new_annots = if page_mut.has(b"Annots") {
+                let mut arr = page_mut.get(b"Annots")?.as_array()?.clone();
+                arr.push(Reference(fid));
+                Array(arr)
+            } else {
+                Array(vec![Reference(fid)])
+            };
+            page_mut.set("Annots", new_annots);
+
+            fid
+        } else {
+            // ── Invisible signature: zero-rect, no AP ──
+            let merged_dict = lopdf::Dictionary::from_iter(vec![
+                ("FT", Name(b"Sig".to_vec())),
+                ("T", Object::String(field_name.into_bytes(), StringFormat::Literal)),
+                ("V", Reference(v_ref)),
+                ("Type", Name(b"Annot".to_vec())),
+                ("Subtype", Name(b"Widget".to_vec())),
+                ("Rect", Array(vec![
+                    0i32.into(), 0i32.into(), 0i32.into(), 0i32.into(),
+                ])),
+                ("P", Reference(target_page_ref)),
+                ("F", Object::Integer(6)), // Hidden + Print
+            ]);
+            let fid = self.raw_document.new_document.add_object(
+                Object::Dictionary(merged_dict),
+            );
+
+            // Clone target page and add to Annots
+            self.raw_document.opt_clone_object_to_new_document(target_page_ref)?;
+            let page_mut = self.raw_document.new_document
+                .get_object_mut(target_page_ref)?.as_dict_mut()?;
+
+            let new_annots = if page_mut.has(b"Annots") {
+                let mut arr = page_mut.get(b"Annots")?.as_array()?.clone();
+                arr.push(Reference(fid));
+                Array(arr)
+            } else {
+                Array(vec![Reference(fid)])
+            };
+            page_mut.set("Annots", new_annots);
+
+            fid
+        };
+
+        // --- Attach field to AcroForm with SigFlags ---
+        // SigFlags = 3 means:
+        //   Bit 1 (1) = SignaturesExist — the document contains signatures
+        //   Bit 2 (2) = AppendOnly     — append-only mode for incremental saves
+        // This is REQUIRED for PDF viewers to show the signature panel.
         match acroform_opt {
             Some(acro_id) => {
                 self.raw_document.opt_clone_object_to_new_document(acro_id)?;
@@ -284,10 +412,12 @@ impl PDFSigningDocument {
                 } else {
                     acro_mut.set("Fields", Array(vec![Reference(sig_field_id)]));
                 }
+                acro_mut.set("SigFlags", Object::Integer(3));
             }
             None => {
                 let new_acro = lopdf::Dictionary::from_iter(vec![
                     ("Fields", Array(vec![Reference(sig_field_id)])),
+                    ("SigFlags", Object::Integer(3)),
                 ]);
                 let new_acro_id = self.raw_document.new_document.add_object(
                     Object::Dictionary(new_acro),
@@ -296,104 +426,6 @@ impl PDFSigningDocument {
                     .get_object_mut(root_id)?.as_dict_mut()?;
                 root_mut.set("AcroForm", Reference(new_acro_id));
             }
-        }
-
-        // --- Resolve target page and rectangle ---
-        let rect = signature_options.signature_rect
-            .unwrap_or(rectangle::Rectangle { x1: 50.0, y1: 50.0, x2: 250.0, y2: 100.0 });
-
-        let target_page_ref = {
-            let prev_doc = self.get_prev_document_ref();
-            find_page_object_id(prev_doc, signature_options.signature_page)?
-        };
-
-        // --- Create appearance XObject from signature image ---
-        let image_name = format!("UserSignature{}", user_info.user_id);
-        let image_object_id = self.add_image_as_form_xobject(
-            Cursor::new(&user_info.user_signature),
-            &image_name,
-            rect,
-        )?;
-
-        // --- Create widget annotation ---
-        let widget_dict = lopdf::Dictionary::from_iter(vec![
-            ("Type", Name("Annot".as_bytes().to_vec())),
-            ("Subtype", Name("Widget".as_bytes().to_vec())),
-            ("Rect", Array(vec![
-                (rect.x1 as i32).into(),
-                (rect.y1 as i32).into(),
-                (rect.x2 as i32).into(),
-                (rect.y2 as i32).into(),
-            ])),
-            ("AP", Object::Dictionary(lopdf::Dictionary::from_iter(vec![
-                ("N", Reference(image_object_id)),
-            ]))),
-        ]);
-        let widget_id = self.raw_document.new_document.add_object(
-            Object::Dictionary(widget_dict),
-        );
-
-        // --- Clone target page and merge Resources ---
-        self.raw_document.opt_clone_object_to_new_document(target_page_ref)?;
-
-        let merged_resources = {
-            let prev_doc = self.get_prev_document_ref();
-            let page_dict = prev_doc.get_object(target_page_ref)?.as_dict()?;
-
-            let mut res_dict = if page_dict.has(b"Resources") {
-                match page_dict.get(b"Resources")? {
-                    Object::Dictionary(d) => d.clone(),
-                    Object::Reference(r) => prev_doc.get_object(*r)?.as_dict()?.clone(),
-                    _ => lopdf::Dictionary::new(),
-                }
-            } else {
-                lopdf::Dictionary::new()
-            };
-
-            let mut xobj_sub = if res_dict.has(b"XObject") {
-                match res_dict.get(b"XObject")? {
-                    Object::Dictionary(d) => d.clone(),
-                    Object::Reference(r) => prev_doc.get_object(*r)?.as_dict()?.clone(),
-                    _ => lopdf::Dictionary::new(),
-                }
-            } else {
-                lopdf::Dictionary::new()
-            };
-
-            xobj_sub.set(image_name.as_bytes().to_vec(), Reference(image_object_id));
-            res_dict.set("XObject", Object::Dictionary(xobj_sub));
-            Object::Dictionary(res_dict)
-        };
-
-        // Set Resources and Annots on the target page
-        let page_mut = self.raw_document.new_document
-            .get_object_mut(target_page_ref)?.as_dict_mut()?;
-        page_mut.set("Resources", merged_resources);
-
-        let new_annots = if page_mut.has(b"Annots") {
-            let mut arr = page_mut.get(b"Annots")?.as_array()?.clone();
-            arr.push(Reference(widget_id));
-            Array(arr)
-        } else {
-            Array(vec![Reference(widget_id)])
-        };
-        page_mut.set("Annots", new_annots);
-
-        // --- Create and attach V dictionary ---
-        let v_obj = build_signature_v_dictionary(user_info, signature_options);
-        let v_ref = self.raw_document.new_document.add_object(v_obj);
-
-        {
-            let field_mut = self.raw_document.new_document
-                .get_object_mut(sig_field_id)?.as_dict_mut()?;
-            field_mut.set("Kids", Array(vec![Reference(widget_id)]));
-            field_mut.set("V", Reference(v_ref));
-        }
-        {
-            let widget_mut = self.raw_document.new_document
-                .get_object_mut(widget_id)?.as_dict_mut()?;
-            widget_mut.set("P", Reference(target_page_ref));
-            widget_mut.set("Parent", Reference(sig_field_id));
         }
 
         // --- Perform cryptographic signing ---

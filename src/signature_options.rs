@@ -25,6 +25,11 @@ pub struct SignatureOptions {
     /// Rectangle that defines the position and size of the visible signature
     /// image on the selected page.  `None` means a sensible default is used.
     pub signature_rect: Option<Rectangle>,
+
+    /// When `true` (the default) the signer's image is rendered as a visible
+    /// annotation on the page.  Set to `false` to create an invisible
+    /// (cryptography-only) digital signature with no visual appearance.
+    pub visible_signature: bool,
 }
 
 impl Default for SignatureOptions {
@@ -41,6 +46,7 @@ impl Default for SignatureOptions {
 
             signature_page: None,
             signature_rect: None,
+            visible_signature: true,
         }
     }
 }

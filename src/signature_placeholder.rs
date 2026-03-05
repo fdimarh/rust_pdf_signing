@@ -333,111 +333,65 @@ mod tests {
         // Clone Root into new document so we can mutate it
         pdf.raw_document.opt_clone_object_to_new_document(root_id).unwrap();
 
-        // Create a simple signature field dictionary (FT=Sig) and set /T to the field name
-        let sig_field_dict = LoDictionary::from_iter(vec![
-            ("FT", LoObject::Name(b"Sig".to_vec())),
-            ("T", LoObject::String(field_name.clone().into_bytes(), StringFormat::Literal)),
-        ]);
-
-        // Add signature field object to new incremental document
-        let sig_field_id = pdf.raw_document.new_document.add_object(LoObject::Dictionary(sig_field_dict));
-
-        // Ensure AcroForm exists in new document and contains Fields with our signature field
-        match acroform_opt {
-             Some(acro_id) => {
-                 // Clone existing AcroForm into new document and then update Fields
-                 pdf.raw_document.opt_clone_object_to_new_document(acro_id).unwrap();
-                 let acro_mut = pdf.raw_document.new_document.get_object_mut(acro_id)?.as_dict_mut()?;
-                 if acro_mut.has(b"Fields") {
-                     // Append to existing array
-                     let fields_obj = acro_mut.get(b"Fields")?;
-                     let mut new_fields = match fields_obj {
-                         LoObject::Array(arr) => arr.clone(),
-                         LoObject::Reference(r) => vec![LoObject::Reference(*r)],
-                         _ => vec![fields_obj.clone()],
-                     };
-                     new_fields.push(LoObject::Reference(sig_field_id));
-                     acro_mut.set("Fields", LoObject::Array(new_fields));
-                 } else {
-                     acro_mut.set("Fields", LoObject::Array(vec![LoObject::Reference(sig_field_id)]));
-                 }
-             }
-             None => {
-                 // Create a new AcroForm and attach to Root
-                 let new_acro = LoDictionary::from_iter(vec![
-                     ("Fields", LoObject::Array(vec![LoObject::Reference(sig_field_id)])),
-                 ]);
-                 let new_acro_id = pdf.raw_document.new_document.add_object(LoObject::Dictionary(new_acro));
-                 // Set Root->AcroForm to reference new_acro_id
-                 let root_mut = pdf.raw_document.new_document.get_object_mut(root_id)?.as_dict_mut()?;
-                 root_mut.set("AcroForm", LoObject::Reference(new_acro_id));
-             }
-         }
-
         // Prepare signature options — place signature on page 1 at a custom rect
         let mut signature_options = SignatureOptions::default();
         signature_options.signature_size = 40_000;
-        signature_options.signature_page = Some(1);  // 1-based: first page
+        signature_options.signature_page = Some(1);
         signature_options.signature_rect = Some(Rectangle { x1: 50., y1: 50., x2: 250., y2: 100. });
 
-        // Resolve the rect and target page from the options
         let rect = signature_options.signature_rect
             .clone()
             .unwrap_or_else(default_signature_rect);
 
-        // Find the target page object-id using the crate-level helper
         let target_page_ref = {
             let prev_doc = pdf.get_prev_document_ref();
             find_page_object_id(prev_doc, signature_options.signature_page)?
         };
 
-        // Create an appearance XObject from the user's signature image
+        // Build V (signature value) dictionary
+        let v_obj = build_signature_v_dictionary(&user_info, &signature_options);
+        let v_ref = pdf.raw_document.new_document.add_object(v_obj);
+
+        // Create appearance XObject from the user's signature image
         use std::io::Cursor;
         let image_name = format!("UserSignature{}", user_info.user_id);
         let image_object_id = pdf
             .add_image_as_form_xobject(Cursor::new(&user_info.user_signature), &image_name, rect)
             .unwrap();
 
-        // Create a widget annotation and attach the appearance
-        let widget_dict = lopdf::Dictionary::from_iter(vec![
+        // Build merged field-widget dictionary (single object = field + annotation)
+        let merged_dict = lopdf::Dictionary::from_iter(vec![
+            ("FT", Name("Sig".as_bytes().to_vec())),
+            ("T", LoObject::String(field_name.clone().into_bytes(), StringFormat::Literal)),
+            ("V", Reference(v_ref)),
             ("Type", Name("Annot".as_bytes().to_vec())),
             ("Subtype", Name("Widget".as_bytes().to_vec())),
-            (
-                "Rect",
-                Array(vec![
-                    (rect.x1 as i32).into(),
-                    (rect.y1 as i32).into(),
-                    (rect.x2 as i32).into(),
-                    (rect.y2 as i32).into(),
-                ]),
-            ),
-            (
-                "AP",
-                Object::Dictionary(lopdf::Dictionary::from_iter(vec![(
-                    "N",
-                    Reference(image_object_id),
-                )])),
-            ),
+            ("Rect", Array(vec![
+                (rect.x1 as i32).into(),
+                (rect.y1 as i32).into(),
+                (rect.x2 as i32).into(),
+                (rect.y2 as i32).into(),
+            ])),
+            ("P", Reference(target_page_ref)),
+            ("AP", Object::Dictionary(lopdf::Dictionary::from_iter(vec![
+                ("N", Reference(image_object_id)),
+            ]))),
+            ("F", LoObject::Integer(4)),
         ]);
+        let sig_field_id = pdf.raw_document.new_document.add_object(Object::Dictionary(merged_dict));
+        eprintln!("Created merged field-widget id: {:?}, target page: {:?}", sig_field_id, target_page_ref);
 
-        let widget_id = pdf.raw_document.new_document.add_object(Object::Dictionary(widget_dict));
-        eprintln!("Created widget id: {:?}, target page: {:?}", widget_id, target_page_ref);
-
-        // Clone the target page into new_document so we can mutate it
+        // Clone target page and merge XObject into Resources
         pdf.raw_document.opt_clone_object_to_new_document(target_page_ref)?;
 
-        // Merge our XObject into the existing page Resources (fonts, colorspaces, etc.)
         let merged_resources = {
             let prev_doc = pdf.get_prev_document_ref();
             let page_dict = prev_doc.get_object(target_page_ref)?.as_dict()?;
 
             let mut res_dict = if page_dict.has(b"Resources") {
-                let res_obj = page_dict.get(b"Resources")?;
-                match res_obj {
+                match page_dict.get(b"Resources")? {
                     Object::Dictionary(d) => d.clone(),
-                    Object::Reference(res_ref) => {
-                        prev_doc.get_object(*res_ref)?.as_dict()?.clone()
-                    }
+                    Object::Reference(res_ref) => prev_doc.get_object(*res_ref)?.as_dict()?.clone(),
                     _ => lopdf::Dictionary::new(),
                 }
             } else {
@@ -445,12 +399,9 @@ mod tests {
             };
 
             let mut xobj_sub = if res_dict.has(b"XObject") {
-                let xobj_obj = res_dict.get(b"XObject")?;
-                match xobj_obj {
+                match res_dict.get(b"XObject")? {
                     Object::Dictionary(d) => d.clone(),
-                    Object::Reference(xobj_ref) => {
-                        prev_doc.get_object(*xobj_ref)?.as_dict()?.clone()
-                    }
+                    Object::Reference(xobj_ref) => prev_doc.get_object(*xobj_ref)?.as_dict()?.clone(),
                     _ => lopdf::Dictionary::new(),
                 }
             } else {
@@ -462,22 +413,18 @@ mod tests {
             Object::Dictionary(res_dict)
         };
 
-        // Set merged Resources and append widget to Annots on the target page
         let page_mut = pdf.raw_document.new_document.get_object_mut(target_page_ref)?.as_dict_mut()?;
         page_mut.set("Resources", merged_resources);
 
         let new_annots = if page_mut.has(b"Annots") {
             let annots = page_mut.get(b"Annots")?.clone();
             match annots {
-                Array(mut arr) => {
-                    arr.push(Reference(widget_id));
-                    Array(arr)
-                }
-                Reference(r) => Array(vec![Reference(r), Reference(widget_id)]),
-                _ => Array(vec![Reference(widget_id)]),
+                Array(mut arr) => { arr.push(Reference(sig_field_id)); Array(arr) }
+                Reference(r) => Array(vec![Reference(r), Reference(sig_field_id)]),
+                _ => Array(vec![Reference(sig_field_id)]),
             }
         } else {
-            Array(vec![Reference(widget_id)])
+            Array(vec![Reference(sig_field_id)])
         };
         page_mut.set("Annots", new_annots);
 
@@ -488,22 +435,29 @@ mod tests {
             eprintln!("Page Resources after modification: {:?}", res_obj);
         }
 
-        // Create V dictionary and insert it into the new document
-        let v_obj = build_signature_v_dictionary(&user_info, &signature_options);
-        let v_ref = pdf.raw_document.new_document.add_object(v_obj);
-
-        // Update the signature field: Kids → widget, V → signature dict
-        {
-            let field_mut = pdf.raw_document.new_document.get_object_mut(sig_field_id)?.as_dict_mut()?;
-            field_mut.set("Kids", Object::Array(vec![Object::Reference(widget_id)]));
-            field_mut.set("V", Object::Reference(v_ref));
-        }
-
-        // Set widget's /P and /Parent entries
-        {
-            let widget_mut = pdf.raw_document.new_document.get_object_mut(widget_id)?.as_dict_mut()?;
-            widget_mut.set("P", Object::Reference(target_page_ref));
-            widget_mut.set("Parent", Object::Reference(sig_field_id));
+        // Attach field to AcroForm with SigFlags = 3
+        match acroform_opt {
+            Some(acro_id) => {
+                pdf.raw_document.opt_clone_object_to_new_document(acro_id).unwrap();
+                let acro_mut = pdf.raw_document.new_document.get_object_mut(acro_id)?.as_dict_mut()?;
+                if acro_mut.has(b"Fields") {
+                    let mut new_fields = acro_mut.get(b"Fields")?.as_array()?.clone();
+                    new_fields.push(LoObject::Reference(sig_field_id));
+                    acro_mut.set("Fields", LoObject::Array(new_fields));
+                } else {
+                    acro_mut.set("Fields", LoObject::Array(vec![LoObject::Reference(sig_field_id)]));
+                }
+                acro_mut.set("SigFlags", LoObject::Integer(3));
+            }
+            None => {
+                let new_acro = LoDictionary::from_iter(vec![
+                    ("Fields", LoObject::Array(vec![LoObject::Reference(sig_field_id)])),
+                    ("SigFlags", LoObject::Integer(3)),
+                ]);
+                let new_acro_id = pdf.raw_document.new_document.add_object(LoObject::Dictionary(new_acro));
+                let root_mut = pdf.raw_document.new_document.get_object_mut(root_id)?.as_dict_mut()?;
+                root_mut.set("AcroForm", LoObject::Reference(new_acro_id));
+            }
         }
 
         // Now perform the actual cryptographic signing which fills the `Contents` and updates `ByteRange`.

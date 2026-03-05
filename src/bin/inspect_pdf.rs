@@ -16,6 +16,12 @@ fn inspect_pdf(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let acro_ref = root_dict.get(b"AcroForm")?.as_reference()?;
         println!("AcroForm object id: {:?}", acro_ref);
         let acro = doc.get_object(acro_ref)?.as_dict()?;
+        // Print SigFlags
+        if acro.has(b"SigFlags") {
+            println!("AcroForm SigFlags: {:?}", acro.get(b"SigFlags")?);
+        } else {
+            println!("AcroForm SigFlags: MISSING ⚠️");
+        }
         if acro.has(b"Fields") {
             let fields = acro.get(b"Fields")?.as_array()?;
             for f in fields {
@@ -23,6 +29,9 @@ fn inspect_pdf(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     Ok(fid) => {
                         println!("Field obj: {:?}", fid);
                         let fdict = doc.get_object(fid)?.as_dict()?;
+                        // Check if merged field-widget
+                        let is_merged = fdict.has(b"FT") && fdict.has(b"Subtype");
+                        println!("  Merged field-widget: {}", is_merged);
                         if fdict.has(b"T") {
                             let t = fdict.get(b"T")?;
                             match t {
