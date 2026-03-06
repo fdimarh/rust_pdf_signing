@@ -285,6 +285,7 @@ pub(crate) fn build_adbe_revocation_attribute(
 ///   attrValues SET OF AttributeValue
 /// }
 /// ```
+#[allow(dead_code)]
 pub(crate) fn build_adbe_revocation_unsigned_der(
     user_certificate_chain: &Vec<CapturedX509Certificate>,
     include_crl: bool,
@@ -343,6 +344,7 @@ pub(crate) fn build_adbe_revocation_unsigned_der(
 ///   [1] unsignedAttrs OPTIONAL
 /// }
 /// ```
+#[allow(dead_code)]
 pub(crate) fn inject_unsigned_attribute_into_cms(
     cms_der: &[u8],
     attr_der: &[u8],
