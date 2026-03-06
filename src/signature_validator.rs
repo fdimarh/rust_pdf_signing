@@ -76,6 +76,14 @@ pub struct ValidationResult {
     /// `true` when the chain order is internally consistent (each cert
     /// signed by the next) and none have expired at the time of validation.
     pub certificate_chain_valid: bool,
+    /// `true` when the root certificate of the chain is a well-known
+    /// trusted CA.  When `false`, the chain may still be structurally
+    /// valid but the root is self-signed or not recognized.
+    pub certificate_chain_trusted: bool,
+    /// Warnings about the certificate chain (e.g. self-signed root,
+    /// untrusted issuer).  These are informational — the signature
+    /// can still be structurally valid.
+    pub chain_warnings: Vec<String>,
 
     // ── LTV (Long-Term Validation) ─────────────────────────
     /// `true` when the PDF contains a document-level DSS dictionary.
@@ -136,6 +144,8 @@ pub struct CertificateInfo {
     pub not_before: Option<DateTime<Utc>>,
     pub not_after: Option<DateTime<Utc>>,
     pub is_expired: bool,
+    /// `true` when subject == issuer (self-signed certificate).
+    pub is_self_signed: bool,
 }
 
 // ───────────────────────── validator ────────────────────────────
@@ -426,6 +436,8 @@ impl SignatureValidator {
         let mut cms_signature_valid = false;
         let mut certificates: Vec<CertificateInfo> = Vec::new();
         let mut certificate_chain_valid = false;
+        let mut certificate_chain_trusted = false;
+        let mut chain_warnings: Vec<String> = Vec::new();
         let is_doc_timestamp = field_info.is_document_timestamp;
 
         if !contents_bytes.is_empty() && !contents_all_zero {
@@ -541,9 +553,13 @@ impl SignatureValidator {
                         }
                     }
 
-                    // Basic certificate chain consistency check
-                    certificate_chain_valid =
-                        Self::check_certificate_chain(&certificates, &now) && !any_expired;
+                    // Certificate chain consistency + trust check
+                    let (chain_ok, chain_trusted_result, chain_warns) =
+                        Self::check_certificate_chain(&certificates, &now);
+                    certificate_chain_valid = chain_ok;
+                    certificate_chain_trusted = chain_trusted_result;
+                    chain_warnings = chain_warns;
+
                     if !certificate_chain_valid && !any_expired {
                         errors.push("Certificate chain validation failed".into());
                     }
@@ -593,6 +609,8 @@ impl SignatureValidator {
             cms_signature_valid,
             certificates,
             certificate_chain_valid,
+            certificate_chain_trusted,
+            chain_warnings,
             has_dss,
             dss_crl_count,
             dss_ocsp_count,
@@ -757,6 +775,7 @@ impl SignatureValidator {
                 let not_after = asn1_time_to_chrono(&validity.not_after);
 
                 let is_expired = not_after.map_or(false, |na| now > na);
+                let is_self_signed = subject == issuer;
 
                 Some(CertificateInfo {
                     subject,
@@ -765,6 +784,7 @@ impl SignatureValidator {
                     not_before,
                     not_after,
                     is_expired,
+                    is_self_signed,
                 })
             })
             .collect()
@@ -956,22 +976,177 @@ impl SignatureValidator {
         None
     }
 
-    /// Simple chain consistency check: for each cert[i] (except the last),
-    /// verify that cert[i].issuer == cert[i+1].subject.
-    fn check_certificate_chain(certs: &[CertificateInfo], _now: &DateTime<Utc>) -> bool {
+    /// Check the certificate chain for structural consistency, expiry,
+    /// and trust status.
+    ///
+    /// Returns `(chain_valid, chain_trusted, warnings)`:
+    /// - `chain_valid`: the chain is internally consistent (issuer linkage)
+    ///   and no certs are expired.
+    /// - `chain_trusted`: the root CA is a known trusted certificate
+    ///   authority (not self-signed with an unknown issuer).
+    /// - `warnings`: human-readable notes about trust issues.
+    fn check_certificate_chain(
+        certs: &[CertificateInfo],
+        _now: &DateTime<Utc>,
+    ) -> (bool, bool, Vec<String>) {
+        let mut warnings = Vec::new();
+
         if certs.is_empty() {
-            return false;
+            return (false, false, vec!["No certificates in signature".into()]);
         }
-        if certs.len() == 1 {
-            // Self-signed or single cert — accept if not expired
-            return !certs[0].is_expired;
-        }
-        for i in 0..certs.len() - 1 {
-            if certs[i].issuer != certs[i + 1].subject {
-                return false;
+
+        // -- Structural consistency: issuer chain linkage --
+        let mut chain_valid = true;
+        if certs.len() > 1 {
+            for i in 0..certs.len() - 1 {
+                if certs[i].issuer != certs[i + 1].subject {
+                    chain_valid = false;
+                    warnings.push(format!(
+                        "Chain break: cert[{}] issuer '{}' does not match cert[{}] subject '{}'",
+                        i, certs[i].issuer, i + 1, certs[i + 1].subject
+                    ));
+                }
             }
         }
-        true
+
+        // -- Expiry check --
+        for (i, c) in certs.iter().enumerate() {
+            if c.is_expired {
+                chain_valid = false;
+                warnings.push(format!(
+                    "Certificate [{}] '{}' has expired (not_after: {:?})",
+                    i,
+                    c.subject,
+                    c.not_after
+                ));
+            }
+        }
+
+        // -- Trust status --
+        // The root cert is the last in the chain.  It is "trusted" if it
+        // is signed by a well-known CA.  For self-signed roots (subject ==
+        // issuer), we flag them as untrusted unless they are a known root.
+        //
+        // Since we don't ship a trust store, we use heuristics:
+        //  1. If the root is self-signed AND is the signing cert itself
+        //     (chain length 1), it's a test/self-signed certificate.
+        //  2. If the root is self-signed but part of a longer chain,
+        //     it may be a private CA root — still warn.
+        //  3. Known public CAs are recognized by common issuer names.
+        let root = &certs[certs.len() - 1];
+        let signer = &certs[0];
+        let chain_trusted;
+
+        if root.is_self_signed {
+            if certs.len() == 1 {
+                // Single self-signed cert — test certificate
+                chain_trusted = false;
+                warnings.push(format!(
+                    "Self-signed certificate: '{}'. \
+                     Not issued by a trusted Certificate Authority.",
+                    signer.subject
+                ));
+            } else {
+                // Self-signed root in a chain — check if it's a known public CA
+                let is_known_ca = Self::is_known_trusted_root(&root.subject);
+                if is_known_ca {
+                    chain_trusted = true;
+                } else {
+                    chain_trusted = false;
+                    warnings.push(format!(
+                        "Root CA '{}' is self-signed but not recognized as a \
+                         trusted public Certificate Authority.",
+                        root.subject
+                    ));
+                }
+            }
+        } else {
+            // Root is not self-signed — the issuing CA cert may not be
+            // included in the chain.  This is common for intermediate CAs
+            // where the root is in the OS trust store.
+            let is_known_issuer = Self::is_known_trusted_root(&root.issuer);
+            if is_known_issuer {
+                chain_trusted = true;
+            } else {
+                chain_trusted = false;
+                warnings.push(format!(
+                    "Issuer '{}' of root certificate '{}' is not recognized \
+                     as a trusted Certificate Authority. The full chain to a \
+                     trusted root may not be included.",
+                    root.issuer, root.subject
+                ));
+            }
+        }
+
+        (chain_valid, chain_trusted, warnings)
+    }
+
+    /// Check if a certificate subject/issuer DN matches a known public
+    /// trusted root CA.  This is a heuristic based on common CA names.
+    fn is_known_trusted_root(dn: &str) -> bool {
+        // Normalize for comparison
+        let dn_lower = dn.to_lowercase();
+
+        // Well-known public root CAs
+        let known_roots = [
+            // DigiCert
+            "digicert",
+            // GlobalSign
+            "globalsign",
+            // Let's Encrypt / ISRG
+            "isrg root",
+            "let's encrypt",
+            // Comodo / Sectigo
+            "comodo",
+            "sectigo",
+            "usertrust",
+            // Entrust
+            "entrust",
+            // GeoTrust
+            "geotrust",
+            // Thawte
+            "thawte",
+            // VeriSign / Symantec
+            "verisign",
+            "symantec",
+            // Baltimore / CyberTrust
+            "baltimore",
+            "cybertrust",
+            // QuoVadis
+            "quovadis",
+            // Buypass
+            "buypass",
+            // SwissSign
+            "swisssign",
+            // Certum
+            "certum",
+            // IdenTrust / DST
+            "identrust",
+            "dst root",
+            // Amazon
+            "amazon root",
+            "starfield",
+            // Microsoft
+            "microsoft root",
+            // Apple
+            "apple root",
+            // Google Trust Services
+            "google trust",
+            "gts root",
+            // Actalis
+            "actalis",
+            // HARICA
+            "harica",
+            // T-TeleSec
+            "t-telesec",
+            "deutsche telekom",
+            // Certigna
+            "certigna",
+            // AC Camerfirma
+            "camerfirma",
+        ];
+
+        known_roots.iter().any(|root| dn_lower.contains(root))
     }
 
     // ── Modification detection (like Adobe Reader) ─────────
@@ -1808,6 +1983,47 @@ mod tests {
             r.errors.iter().any(|e| e.contains("modified after")),
             "Should have an error about post-signing modification"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_certificate_chain_trust_warnings() -> Result<(), Box<dyn std::error::Error>> {
+        // Our test certificates are self-signed / from a test CA,
+        // so they should produce trust warnings but still be structurally parseable.
+        let pdf_bytes = fs::read("examples/assets/sample-signed.pdf")
+            .or_else(|_| fs::read("examples/result.pdf"))?;
+
+        let results = SignatureValidator::validate(&pdf_bytes)?;
+        assert!(!results.is_empty());
+
+        let r = &results[0];
+        eprintln!("=== Certificate Trust ===");
+        eprintln!("  chain_valid:   {}", r.certificate_chain_valid);
+        eprintln!("  chain_trusted: {}", r.certificate_chain_trusted);
+        eprintln!("  warnings:      {:?}", r.chain_warnings);
+        for c in &r.certificates {
+            eprintln!(
+                "  cert: subject={}, self_signed={}",
+                c.subject, c.is_self_signed
+            );
+        }
+
+        // Test certificates should NOT be trusted (they are from a test CA)
+        assert!(
+            !r.certificate_chain_trusted,
+            "Test certificate should not be trusted"
+        );
+        // Should have at least one warning about trust
+        assert!(
+            !r.chain_warnings.is_empty(),
+            "Should have chain trust warnings for test certificates"
+        );
+
+        // The CMS should still parse and the signature should still verify
+        // (trust is a warning, not a structural failure)
+        assert!(r.cms_signature_valid, "CMS should still be valid");
+        assert!(r.digest_match, "Digest should still match");
 
         Ok(())
     }

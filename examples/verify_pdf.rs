@@ -81,6 +81,21 @@ fn print_result(r: &ValidationResult, index: usize, total_sigs: usize) {
             "INVALID ❌"
         }
     );
+    println!(
+        "  Chain trusted:      {}",
+        if r.certificate_chain_trusted {
+            "yes — signed by a recognized Certificate Authority ✅"
+        } else if r.certificate_chain_valid {
+            "NOT TRUSTED ⚠️  — signer identity cannot be verified"
+        } else {
+            "NOT TRUSTED ❌"
+        }
+    );
+    if !r.chain_warnings.is_empty() {
+        for w in &r.chain_warnings {
+            println!("    ⚠️  {}", w);
+        }
+    }
     println!();
 
     // LTV (Long-Term Validation)
@@ -211,6 +226,9 @@ fn print_result(r: &ValidationResult, index: usize, total_sigs: usize) {
             "        Expired:    {}",
             if c.is_expired { "YES ⚠️" } else { "no" }
         );
+        if c.is_self_signed {
+            println!("        Self-signed: YES ⚠️");
+        }
     }
 
     // Errors
@@ -251,6 +269,8 @@ fn verify_pdf(path: &str) {
             let all_valid = results.iter().all(|r| r.is_valid());
             let all_cms_ok = results.iter().all(|r| r.cms_signature_valid);
             let all_digest_ok = results.iter().all(|r| r.digest_match);
+            let all_trusted = results.iter().all(|r| r.certificate_chain_trusted);
+            let any_untrusted = results.iter().any(|r| !r.certificate_chain_trusted);
 
             println!("══════════════════════════════════════════════");
             println!("  SUMMARY");
@@ -265,13 +285,31 @@ fn verify_pdf(path: &str) {
                 if all_digest_ok { "yes ✅" } else { "NO ❌" }
             );
             println!(
+                "  All chains trusted: {}",
+                if all_trusted {
+                    "yes ✅"
+                } else {
+                    "NO ⚠️  (one or more signers not from a recognized CA)"
+                }
+            );
+            println!(
                 "  Overall:            {}",
                 if all_valid {
-                    "✅ ALL SIGNATURES VALID"
+                    if all_trusted {
+                        "✅ ALL SIGNATURES VALID"
+                    } else {
+                        "✅ ALL SIGNATURES VALID (but signer identity not verified — see warnings)"
+                    }
                 } else {
                     "❌ ONE OR MORE SIGNATURES INVALID"
                 }
             );
+            if any_untrusted && all_valid {
+                println!();
+                println!("  ⚠️  Note: Signature integrity is intact, but one or more signing");
+                println!("     certificates are not issued by a recognized Certificate Authority.");
+                println!("     The signer's identity cannot be independently verified.");
+            }
             println!();
 
             if !all_valid {
