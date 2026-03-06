@@ -50,6 +50,10 @@ pub struct ValidationResult {
     pub contact_info: Option<String>,
     pub reason: Option<String>,
     pub signing_time: Option<String>,
+    /// The `/Filter` value (e.g. "Adobe.PPKLite").
+    pub filter: Option<String>,
+    /// The `/SubFilter` value (e.g. "adbe.pkcs7.detached" or "ETSI.CAdES.detached").
+    pub sub_filter: Option<String>,
 
     // ── byte‐range ─────────────────────────────────────────
     pub byte_range: Vec<i64>,
@@ -106,7 +110,6 @@ impl ValidationResult {
         self.digest_match
             && self.cms_signature_valid
             && self.certificate_chain_valid
-            && self.byte_range_covers_whole_file
             && self.errors.is_empty()
     }
 }
@@ -149,6 +152,24 @@ impl SignatureValidator {
             let result = Self::validate_one(pdf_bytes, &doc, field_info)?;
             results.push(result);
         }
+
+        // In a multi-signature document, only the *last* signature (the most
+        // recent incremental update) is expected to cover the entire file.
+        // Earlier signatures legitimately have a ByteRange that ends before
+        // subsequent incremental updates.
+        let total = results.len();
+        if total > 0 {
+            let last_idx = total - 1;
+            if !results[last_idx].byte_range_covers_whole_file {
+                results[last_idx].errors.push(
+                    "ByteRange does not cover the entire file".into(),
+                );
+            }
+            // For earlier signatures in multi-sig docs, no error is added;
+            // the `byte_range_covers_whole_file` field still records the
+            // fact, so callers can inspect it if needed.
+        }
+
         Ok(results)
     }
 
@@ -213,10 +234,50 @@ impl SignatureValidator {
                 continue;
             }
 
-            // Must have a V entry (the signature value dict)
-            let v_ref = match f_dict.get(b"V").and_then(|o| o.as_reference()) {
-                Ok(r) => r,
-                Err(_) => continue,
+            // Must have a V entry (the signature value dict) OR be a merged
+            // DocTimeStamp where the field dict itself contains ByteRange/Contents.
+            let (v_ref, is_document_timestamp) = match f_dict.get(b"V").and_then(|o| o.as_reference()) {
+                Ok(r) => {
+                    // Standard case: separate V dictionary
+                    let v_dict_opt = doc
+                        .get_object(r)
+                        .and_then(|o| o.as_dict())
+                        .ok();
+                    // A document timestamp can be identified by either:
+                    //   /Type /DocTimeStamp  (PDF 2.0 style)
+                    //   /SubFilter /ETSI.RFC3161  (works with /Type /Sig too)
+                    let is_ts = v_dict_opt.map_or(false, |vd| {
+                        let type_is_ts = vd
+                            .get(b"Type")
+                            .ok()
+                            .and_then(|t| t.as_name_str().ok())
+                            .map_or(false, |name| name == "DocTimeStamp");
+                        let subfilter_is_ts = vd
+                            .get(b"SubFilter")
+                            .ok()
+                            .and_then(|t| t.as_name_str().ok())
+                            .map_or(false, |name| name == "ETSI.RFC3161");
+                        type_is_ts || subfilter_is_ts
+                    });
+                    (r, is_ts)
+                }
+                Err(_) => {
+                    // Check if this is a merged DocTimeStamp field-widget-value dict:
+                    // the dict itself has /Type /DocTimeStamp, /Contents, /ByteRange
+                    let is_merged_ts = f_dict
+                        .get(b"Type")
+                        .and_then(|t| t.as_name_str())
+                        .ok()
+                        .map_or(false, |name| name == "DocTimeStamp")
+                        && f_dict.has(b"Contents")
+                        && f_dict.has(b"ByteRange");
+                    if is_merged_ts {
+                        // Use the field's own object ID as the V object ID
+                        (f_ref, true)
+                    } else {
+                        continue;
+                    }
+                }
             };
 
             let field_name = f_dict
@@ -227,14 +288,6 @@ impl SignatureValidator {
                     _ => None,
                 });
 
-            // Check if this is a DocTimeStamp by inspecting the V dictionary
-            let is_document_timestamp = doc
-                .get_object(v_ref)
-                .and_then(|o| o.as_dict())
-                .ok()
-                .and_then(|vd| vd.get(b"Type").ok())
-                .and_then(|t| t.as_name_str().ok())
-                .map_or(false, |name| name == "DocTimeStamp");
 
             sig_fields.push(SignatureFieldInfo {
                 field_name,
@@ -265,6 +318,16 @@ impl SignatureValidator {
         let contact_info = Self::get_string(v_dict, b"ContactInfo");
         let reason = Self::get_string(v_dict, b"Reason");
         let signing_time = Self::get_string(v_dict, b"M");
+        let filter = v_dict
+            .get(b"Filter")
+            .ok()
+            .and_then(|o| o.as_name_str().ok())
+            .map(|s| s.to_string());
+        let sub_filter = v_dict
+            .get(b"SubFilter")
+            .ok()
+            .and_then(|o| o.as_name_str().ok())
+            .map(|s| s.to_string());
 
         // ── ByteRange ──────────────────────────────────────
         let byte_range_arr = v_dict
@@ -295,9 +358,11 @@ impl SignatureValidator {
             false
         };
 
-        if !byte_range_covers_whole_file {
-            errors.push("ByteRange does not cover the entire file".into());
-        }
+        // Note: we do NOT add an error here for !byte_range_covers_whole_file
+        // because in multi-signature PDFs, earlier signatures legitimately
+        // do not cover the entire file (subsequent incremental updates are
+        // appended after them).  The caller (validate()) adds a contextual
+        // warning only when a single-signature document fails this check.
 
         // ── extract Contents (the DER-encoded PKCS#7) ──────
         let contents_bytes = match v_dict.get(b"Contents") {
@@ -483,6 +548,8 @@ impl SignatureValidator {
             contact_info,
             reason,
             signing_time,
+            filter,
+            sub_filter,
             byte_range,
             byte_range_covers_whole_file,
             computed_digest,

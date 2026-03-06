@@ -236,6 +236,7 @@ impl PDFSigningDocument {
         sig_size: usize,
     ) -> Result<Vec<u8>, Error> {
         use crate::ltv::fetch_timestamp_token;
+        use crate::signature_placeholder::find_page_object_id;
         use lopdf::{Dictionary, IncrementalDocument, Object, StringFormat};
 
         let mut doc = IncrementalDocument::load_from(pdf_bytes.as_slice())?;
@@ -243,9 +244,15 @@ impl PDFSigningDocument {
 
         let placeholder_size = sig_size;
 
-        // Build the document timestamp V dictionary with placeholder Contents
+        // Resolve page 1 for the /P entry
+        let page_ref = find_page_object_id(doc.get_prev_documents(), Some(1))?;
+
+        // ── Build the signature value (V) dictionary ──
+        //
+        // This contains /Type /DocTimeStamp plus /Filter, /SubFilter,
+        // /ByteRange, and /Contents — the cryptographic payload.
         let v_dict = Dictionary::from_iter(vec![
-            ("Type", Object::Name(b"DocTimeStamp".to_vec())),
+            ("Type", Object::Name(b"Sig".to_vec())),
             ("Filter", Object::Name(b"Adobe.PPKLite".to_vec())),
             ("SubFilter", Object::Name(b"ETSI.RFC3161".to_vec())),
             (
@@ -267,16 +274,19 @@ impl PDFSigningDocument {
         ]);
         let v_ref = doc.new_document.add_object(Object::Dictionary(v_dict));
 
-        // Build a merged field-widget for the timestamp
+        // ── Build the field + widget annotation dictionary ──
+        //
+        // This is a merged field-widget that references the V dictionary.
+        // Adobe requires /V to point to the signature value dict so that
+        // it recognises the field as "signed" (not "unsigned placeholder").
         let ts_field_name = format!("DocTimestamp{}", rand::random::<u32>());
-        let ts_dict = Dictionary::from_iter(vec![
+        let field_dict = Dictionary::from_iter(vec![
             ("FT", Object::Name(b"Sig".to_vec())),
             (
                 "T",
                 Object::String(ts_field_name.into_bytes(), StringFormat::Literal),
             ),
             ("V", Object::Reference(v_ref)),
-            ("Type", Object::Name(b"Annot".to_vec())),
             ("Subtype", Object::Name(b"Widget".to_vec())),
             (
                 "Rect",
@@ -287,9 +297,25 @@ impl PDFSigningDocument {
                     0i32.into(),
                 ]),
             ),
+            ("P", Object::Reference(page_ref)),
             ("F", Object::Integer(6)), // Hidden + Print
         ]);
-        let ts_field_ref = doc.new_document.add_object(Object::Dictionary(ts_dict));
+        let ts_field_ref = doc.new_document.add_object(Object::Dictionary(field_dict));
+
+        // Add to page Annots array
+        doc.opt_clone_object_to_new_document(page_ref)?;
+        let page_mut = doc
+            .new_document
+            .get_object_mut(page_ref)?
+            .as_dict_mut()?;
+        let new_annots = if page_mut.has(b"Annots") {
+            let mut arr = page_mut.get(b"Annots")?.as_array()?.clone();
+            arr.push(Object::Reference(ts_field_ref));
+            Object::Array(arr)
+        } else {
+            Object::Array(vec![Object::Reference(ts_field_ref)])
+        };
+        page_mut.set("Annots", new_annots);
 
         // Add to AcroForm.Fields and set SigFlags
         let root_id = doc

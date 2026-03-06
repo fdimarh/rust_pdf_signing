@@ -23,6 +23,10 @@ Options:
   --name <name>             Signer name              (default: Signer)
   --email <email>           Signer email             (default: signer@example.com)
   --reason <text>           Signing reason            (default: Digital Signature)
+  --dss                     Include DSS dictionary (CRL/OCSP/Certs at document level)
+  --crl                     Include CRL in CMS signed attributes (default for pkcs7)
+  --ocsp                    Include OCSP in CMS signed attributes
+  --no-crl                  Exclude CRL from CMS signed attributes
   -h, --help                Show this help
 
 PAdES Levels:
@@ -66,6 +70,9 @@ fn main() {
     let mut signer_name = "Signer".to_string();
     let mut signer_email = "signer@example.com".to_string();
     let mut reason = "Digital Signature".to_string();
+    let mut include_dss = false;
+    let mut include_crl: Option<bool> = None; // None = use default per format
+    let mut include_ocsp = false;
 
     let mut i = 2;
     while i < args.len() {
@@ -130,6 +137,18 @@ fn main() {
             "--reason" => {
                 i += 1;
                 reason = args.get(i).expect("Missing value for --reason").clone();
+            }
+            "--dss" => {
+                include_dss = true;
+            }
+            "--crl" => {
+                include_crl = Some(true);
+            }
+            "--no-crl" => {
+                include_crl = Some(false);
+            }
+            "--ocsp" => {
+                include_ocsp = true;
             }
             other => {
                 eprintln!("Unknown option: {}", other);
@@ -228,6 +247,9 @@ fn main() {
     opts.format = format;
     opts.pades_level = pades_level;
     opts.signature_size = 40_000;
+    opts.include_dss = include_dss;
+    opts.signed_attribute_include_crl = include_crl.unwrap_or(opts.signed_attribute_include_crl);
+    opts.signed_attribute_include_ocsp = include_ocsp;
     opts.signature_page = Some(page);
     opts.signature_rect = Some(Rectangle {
         x1: rect.0,

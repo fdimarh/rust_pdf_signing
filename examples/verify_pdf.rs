@@ -2,7 +2,7 @@ use pdf_signing::signature_validator::{SignatureValidator, ValidationResult};
 use std::env;
 use std::process;
 
-fn print_result(r: &ValidationResult, index: usize) {
+fn print_result(r: &ValidationResult, index: usize, total_sigs: usize) {
     let status = if r.is_valid() { "✅ VALID" } else { "❌ INVALID" };
     let sig_type = if r.field_info.is_document_timestamp {
         "Document Timestamp"
@@ -13,6 +13,21 @@ fn print_result(r: &ValidationResult, index: usize) {
     println!("─────────────────────────────────────────────");
     println!("Signature #{}: {} ({})", index + 1, status, sig_type);
     println!("─────────────────────────────────────────────");
+
+    // Signature format
+    let sub_filter_str = r.sub_filter.as_deref().unwrap_or("(unknown)");
+    let format_label = match sub_filter_str {
+        "adbe.pkcs7.detached" => "PKCS#7 (pre-PAdES / Adobe legacy)",
+        "ETSI.CAdES.detached" => "PAdES (CAdES-based, ETSI standard)",
+        "ETSI.RFC3161" => "RFC 3161 Document Timestamp",
+        _ => sub_filter_str,
+    };
+    println!(
+        "  Filter:             {}",
+        r.filter.as_deref().unwrap_or("(unknown)")
+    );
+    println!("  SubFilter:          {} — {}", sub_filter_str, format_label);
+
     println!(
         "  Signer:             {}",
         r.signer_name.as_deref().unwrap_or("(unknown)")
@@ -36,9 +51,11 @@ fn print_result(r: &ValidationResult, index: usize) {
     println!(
         "  Covers whole file:  {}",
         if r.byte_range_covers_whole_file {
-            "yes"
+            "yes".to_string()
+        } else if total_sigs > 1 && index < total_sigs - 1 {
+            "no (expected — subsequent signatures appended after this one)".to_string()
         } else {
-            "NO ⚠️"
+            "NO ⚠️".to_string()
         }
     );
     println!();
@@ -67,6 +84,9 @@ fn print_result(r: &ValidationResult, index: usize) {
     println!();
 
     // LTV (Long-Term Validation)
+    let is_pkcs7 = r.sub_filter.as_deref() == Some("adbe.pkcs7.detached");
+    let is_pades = r.sub_filter.as_deref() == Some("ETSI.CAdES.detached");
+
     println!(
         "  LTV enabled:        {}",
         if r.is_ltv_enabled {
@@ -108,6 +128,46 @@ fn print_result(r: &ValidationResult, index: usize) {
             "not embedded"
         }
     );
+
+    // LTV analysis context
+    if r.is_ltv_enabled {
+        if is_pkcs7 {
+            println!("  ─── LTV Method: Adobe Pre-PAdES ───");
+            println!("  Revocation data embedded via adbe-revocationInfoArchival");
+            println!("  (Adobe proprietary OID 1.2.840.113583.1.1.8)");
+            if r.has_dss {
+                println!("  Plus DSS dictionary at document level for additional data.");
+            }
+            println!("  Timestamp anchors signature to a specific time.");
+            println!("  → Signature can be validated offline after certificate expiry.");
+        } else if is_pades {
+            let level = if r.has_dss && r.has_timestamp {
+                "B-LT or higher"
+            } else if r.has_timestamp {
+                "B-T"
+            } else {
+                "B-B (basic)"
+            };
+            println!("  ─── LTV Method: PAdES (ETSI EN 319 142) ───");
+            println!("  Estimated PAdES level: {}", level);
+            if r.has_dss {
+                println!("  DSS dictionary provides CRL/OCSP/Certs for offline validation.");
+            }
+            if r.has_cms_revocation_data {
+                println!("  CMS-embedded revocation data also present.");
+            }
+        }
+    } else {
+        println!("  ─── LTV Analysis ───");
+        if !r.has_timestamp && !(r.has_cms_revocation_data || (r.has_dss && (r.dss_crl_count > 0 || r.dss_ocsp_count > 0))) {
+            println!("  Missing: timestamp AND revocation data (CRL/OCSP).");
+        } else if !r.has_timestamp {
+            println!("  Missing: signature timestamp (needed to anchor validation time).");
+        } else {
+            println!("  Missing: revocation data (CRL/OCSP) for certificate chain.");
+        }
+        println!("  → Signature cannot be verified long-term after certificate expiry.");
+    }
     println!();
 
     // Certificates
@@ -159,7 +219,7 @@ fn verify_pdf(path: &str) {
         Ok(results) => {
             println!("  Found {} signature(s)\n", results.len());
             for (i, r) in results.iter().enumerate() {
-                print_result(r, i);
+                print_result(r, i, results.len());
             }
 
             // Print overall summary
