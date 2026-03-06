@@ -77,7 +77,7 @@ impl PDFSigningDocument {
                 }
             };
 
-            if child_dict.get(b"Type")?.as_name_str()? == "Annot" {
+            if child_dict.get(b"Type")?.as_name()? == b"Annot" {
                 // Copy child to new incremental update
                 self.raw_document
                     .opt_clone_object_to_new_document(child_obj_id)?;

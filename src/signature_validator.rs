@@ -70,6 +70,8 @@ pub struct ValidationResult {
     /// `true` when the ByteRange covers the entire file (no gaps other than
     /// the `Contents` hex‐string).
     pub byte_range_covers_whole_file: bool,
+    /// `true` when the PDF document is (or was) encrypted.
+    pub is_encrypted: bool,
 
     // ── cryptographic checks ───────────────────────────────
     /// SHA‑256 digest of the signed portion of the file.
@@ -192,9 +194,49 @@ impl SignatureValidator {
 
     /// Validate **every** digital signature found in `pdf_bytes`.
     /// Returns one [`ValidationResult`] per signature field.
+    ///
+    /// If the PDF is encrypted, this will attempt decryption with an empty
+    /// password (which works for PDFs that only have permission restrictions
+    /// but no user password).  For user-password-protected PDFs, use
+    /// [`validate_with_password`] instead.
     pub fn validate(pdf_bytes: &[u8]) -> Result<Vec<ValidationResult>, Error> {
-        let doc = Document::load_mem(pdf_bytes)
+        Self::validate_with_password(pdf_bytes, None)
+    }
+
+    /// Validate **every** digital signature found in `pdf_bytes`,
+    /// decrypting with the given `password` if the PDF is encrypted.
+    ///
+    /// Pass `Some(b"mypassword")` for password-protected PDFs, or `None`
+    /// to attempt decryption with an empty password (works for PDFs with
+    /// only permission/owner restrictions but no user password).
+    pub fn validate_with_password(
+        pdf_bytes: &[u8],
+        password: Option<&[u8]>,
+    ) -> Result<Vec<ValidationResult>, Error> {
+        let mut doc = Document::load_mem(pdf_bytes)
             .map_err(|e| Error::Other(format!("Failed to load PDF: {}", e)))?;
+
+        // Handle encrypted PDFs
+        // lopdf 0.39: is_encrypted() checks current state, was_encrypted()
+        // checks if the document was ever encrypted (including auto-decrypted)
+        let was_encrypted = doc.is_encrypted() || doc.was_encrypted();
+        if doc.is_encrypted() {
+            let pw = password.unwrap_or(b"");
+            doc.decrypt_raw(pw).map_err(|e| {
+                if password.is_some() {
+                    Error::Other(format!(
+                        "Failed to decrypt PDF with the provided password: {}",
+                        e
+                    ))
+                } else {
+                    Error::Other(format!(
+                        "PDF is encrypted. Provide a password with --password. \
+                         Decryption error: {}",
+                        e
+                    ))
+                }
+            })?;
+        }
 
         let fields = Self::find_signature_fields(&doc)?;
         if fields.is_empty() {
@@ -205,7 +247,8 @@ impl SignatureValidator {
 
         let mut results = Vec::with_capacity(fields.len());
         for field_info in fields {
-            let result = Self::validate_one(pdf_bytes, &doc, field_info)?;
+            let mut result = Self::validate_one(pdf_bytes, &doc, field_info)?;
+            result.is_encrypted = was_encrypted;
             results.push(result);
         }
 
@@ -230,7 +273,7 @@ impl SignatureValidator {
         // ── Modification detection ──
         // For each non-last signature, check that incremental updates
         // added AFTER its revision contain only permitted changes.
-        Self::detect_modifications(pdf_bytes, &mut results)?;
+        Self::detect_modifications(pdf_bytes, &mut results, password)?;
 
         // ── pdf-insecurity.org attack detection ──
         // 1. USF: Validate ByteRange structure
@@ -294,7 +337,16 @@ impl SignatureValidator {
     /// Validate a single PDF and return a short summary string (handy for
     /// quick checks / CLI tools).
     pub fn validate_summary(pdf_bytes: &[u8]) -> Result<String, Error> {
-        let results = Self::validate(pdf_bytes)?;
+        Self::validate_summary_with_password(pdf_bytes, None)
+    }
+
+    /// Validate a single PDF (with optional password) and return a short
+    /// summary string.
+    pub fn validate_summary_with_password(
+        pdf_bytes: &[u8],
+        password: Option<&[u8]>,
+    ) -> Result<String, Error> {
+        let results = Self::validate_with_password(pdf_bytes, password)?;
         let mut lines = Vec::new();
         for (i, r) in results.iter().enumerate() {
             let status = if r.is_valid() { "VALID" } else { "INVALID" };
@@ -344,8 +396,8 @@ impl SignatureValidator {
             };
 
             // Must be FT = Sig
-            if let Ok(ft) = f_dict.get(b"FT").and_then(|o| o.as_name_str()) {
-                if ft != "Sig" {
+            if let Ok(ft) = f_dict.get(b"FT").and_then(|o| o.as_name()) {
+                if ft != b"Sig" {
                     continue;
                 }
             } else {
@@ -368,13 +420,13 @@ impl SignatureValidator {
                         let type_is_ts = vd
                             .get(b"Type")
                             .ok()
-                            .and_then(|t| t.as_name_str().ok())
-                            .map_or(false, |name| name == "DocTimeStamp");
+                            .and_then(|t| t.as_name().ok())
+                            .map_or(false, |name| name == b"DocTimeStamp");
                         let subfilter_is_ts = vd
                             .get(b"SubFilter")
                             .ok()
-                            .and_then(|t| t.as_name_str().ok())
-                            .map_or(false, |name| name == "ETSI.RFC3161");
+                            .and_then(|t| t.as_name().ok())
+                            .map_or(false, |name| name == b"ETSI.RFC3161");
                         type_is_ts || subfilter_is_ts
                     });
                     (r, is_ts)
@@ -384,9 +436,9 @@ impl SignatureValidator {
                     // the dict itself has /Type /DocTimeStamp, /Contents, /ByteRange
                     let is_merged_ts = f_dict
                         .get(b"Type")
-                        .and_then(|t| t.as_name_str())
+                        .and_then(|t| t.as_name())
                         .ok()
-                        .map_or(false, |name| name == "DocTimeStamp")
+                        .map_or(false, |name| name == b"DocTimeStamp")
                         && f_dict.has(b"Contents")
                         && f_dict.has(b"ByteRange");
                     if is_merged_ts {
@@ -439,13 +491,13 @@ impl SignatureValidator {
         let filter = v_dict
             .get(b"Filter")
             .ok()
-            .and_then(|o| o.as_name_str().ok())
-            .map(|s| s.to_string());
+            .and_then(|o| o.as_name().ok())
+            .map(|s| String::from_utf8_lossy(s).to_string());
         let sub_filter = v_dict
             .get(b"SubFilter")
             .ok()
-            .and_then(|o| o.as_name_str().ok())
-            .map(|s| s.to_string());
+            .and_then(|o| o.as_name().ok())
+            .map(|s| String::from_utf8_lossy(s).to_string());
 
         // ── ByteRange ──────────────────────────────────────
         let byte_range_arr = v_dict
@@ -676,6 +728,7 @@ impl SignatureValidator {
             sub_filter,
             byte_range,
             byte_range_covers_whole_file,
+            is_encrypted: false,
             computed_digest,
             digest_match,
             cms_signature_valid,
@@ -1555,9 +1608,9 @@ impl SignatureValidator {
 
                 if let Ok(tm) = ref_dict
                     .get(b"TransformMethod")
-                    .and_then(|o| o.as_name_str())
+                    .and_then(|o| o.as_name())
                 {
-                    if tm == "DocMDP" {
+                    if tm == b"DocMDP" {
                         if let Ok(tp) = ref_dict.get(b"TransformParams") {
                             let tp_dict = match tp {
                                 Object::Dictionary(d) => d,
@@ -1660,6 +1713,19 @@ impl SignatureValidator {
         offsets
     }
 
+    /// Load PDF from memory and decrypt if needed.
+    fn load_and_decrypt(
+        pdf_bytes: &[u8],
+        password: Option<&[u8]>,
+    ) -> Result<Document, lopdf::Error> {
+        let mut doc = Document::load_mem(pdf_bytes)?;
+        if doc.is_encrypted() {
+            let pw = password.unwrap_or(b"");
+            doc.decrypt_raw(pw)?;
+        }
+        Ok(doc)
+    }
+
     /// For each signature, check whether subsequent revisions contain
     /// only permitted modifications.
     ///
@@ -1681,6 +1747,7 @@ impl SignatureValidator {
     fn detect_modifications(
         pdf_bytes: &[u8],
         results: &mut [ValidationResult],
+        password: Option<&[u8]>,
     ) -> Result<(), Error> {
         let total = results.len();
         if total == 0 {
@@ -1715,7 +1782,7 @@ impl SignatureValidator {
             // Parse the PDF up to this signature's revision end to get
             // the "original" state of objects.
             let revision_bytes = &pdf_bytes[..rev_end];
-            let revision_doc = match Document::load_mem(revision_bytes) {
+            let revision_doc = match Self::load_and_decrypt(revision_bytes, password) {
                 Ok(d) => d,
                 Err(_) => {
                     // If we can't parse the revision, we can't check
@@ -1728,7 +1795,7 @@ impl SignatureValidator {
             };
 
             // Parse the full document to see what changed
-            let full_doc = match Document::load_mem(pdf_bytes) {
+            let full_doc = match Self::load_and_decrypt(pdf_bytes, password) {
                 Ok(d) => d,
                 Err(_) => {
                     results[sig_idx].no_unauthorized_modifications = true;
@@ -1863,14 +1930,14 @@ impl SignatureValidator {
         match obj {
             Object::Dictionary(dict) => {
                 // Signature value dictionary (/Type /Sig or /Type /DocTimeStamp)
-                if let Ok(type_name) = dict.get(b"Type").and_then(|o| o.as_name_str()) {
-                    match type_name {
-                        "Sig" | "DocTimeStamp" => {
+                if let Ok(type_name) = dict.get(b"Type").and_then(|o| o.as_name()) {
+                    match &type_name[..] {
+                        b"Sig" | b"DocTimeStamp" => {
                             return ObjectChange::Permitted("signature value dictionary".into());
                         }
-                        "Annot" => {
-                            if let Ok(subtype) = dict.get(b"Subtype").and_then(|o| o.as_name_str()) {
-                                if subtype == "Widget" {
+                        b"Annot" => {
+                            if let Ok(subtype) = dict.get(b"Subtype").and_then(|o| o.as_name()) {
+                                if subtype == b"Widget" {
                                     // Widget is only permitted if linked to a Sig field
                                     if dict.has(b"FT") || dict.has(b"V") || dict.has(b"Parent") {
                                         return ObjectChange::Permitted("widget annotation".into());
@@ -1879,33 +1946,34 @@ impl SignatureValidator {
                                 }
                                 // [EAA] Evil Annotation Attack: reject dangerous
                                 // annotation subtypes that can overlay signed content
+                                let sub: &[u8] = &subtype[..];
                                 let dangerous = matches!(
-                                    subtype,
-                                    "FreeText" | "Stamp" | "Redact" | "Watermark"
-                                        | "Square" | "Circle" | "Line" | "Ink"
-                                        | "FileAttachment" | "RichMedia" | "Screen"
-                                        | "3D" | "Sound" | "Movie" | "Polygon"
-                                        | "PolyLine" | "Caret" | "Highlight"
-                                        | "Underline" | "Squiggly" | "StrikeOut"
-                                        | "Text" | "Popup"
+                                    sub,
+                                    b"FreeText" | b"Stamp" | b"Redact" | b"Watermark"
+                                        | b"Square" | b"Circle" | b"Line" | b"Ink"
+                                        | b"FileAttachment" | b"RichMedia" | b"Screen"
+                                        | b"3D" | b"Sound" | b"Movie" | b"Polygon"
+                                        | b"PolyLine" | b"Caret" | b"Highlight"
+                                        | b"Underline" | b"Squiggly" | b"StrikeOut"
+                                        | b"Text" | b"Popup"
                                 );
                                 if dangerous {
                                     return ObjectChange::Unauthorized(format!(
                                         "[EAA] dangerous annotation /Subtype /{}",
-                                        subtype
+                                        String::from_utf8_lossy(subtype)
                                     ));
                                 }
                                 // Link annotations are generally safe
-                                if subtype == "Link" {
+                                if subtype == b"Link" {
                                     return ObjectChange::Permitted("link annotation".into());
                                 }
                                 return ObjectChange::Unauthorized(format!(
                                     "annotation /Subtype /{}",
-                                    subtype
+                                    String::from_utf8_lossy(subtype)
                                 ));
                             }
                         }
-                        "Catalog" => {
+                        b"Catalog" => {
                             return ObjectChange::Permitted("catalog update".into());
                         }
                         _ => {}
@@ -1913,15 +1981,15 @@ impl SignatureValidator {
                 }
 
                 // Signature field (/FT /Sig)
-                if let Ok(ft) = dict.get(b"FT").and_then(|o| o.as_name_str()) {
-                    if ft == "Sig" {
+                if let Ok(ft) = dict.get(b"FT").and_then(|o| o.as_name()) {
+                    if ft == b"Sig" {
                         return ObjectChange::Permitted("signature field".into());
                     }
                 }
 
                 // Widget annotation without /Type key
-                if let Ok(subtype) = dict.get(b"Subtype").and_then(|o| o.as_name_str()) {
-                    if subtype == "Widget" {
+                if let Ok(subtype) = dict.get(b"Subtype").and_then(|o| o.as_name()) {
+                    if subtype == b"Widget" {
                         if dict.has(b"FT") || dict.has(b"V") {
                             return ObjectChange::Permitted(
                                 "signature field/widget annotation".into(),
@@ -1966,16 +2034,16 @@ impl SignatureValidator {
             Object::Stream(stream) => {
                 // Streams for CRL, OCSP, or certificate data (used in DSS)
                 let dict = &stream.dict;
-                if let Ok(type_name) = dict.get(b"Type").and_then(|o| o.as_name_str()) {
-                    if type_name == "XObject" {
+                if let Ok(type_name) = dict.get(b"Type").and_then(|o| o.as_name()) {
+                    if type_name == b"XObject" {
                         // Could be a signature appearance — check Subtype
-                        if let Ok(subtype) = dict.get(b"Subtype").and_then(|o| o.as_name_str()) {
-                            if subtype == "Form" {
+                        if let Ok(subtype) = dict.get(b"Subtype").and_then(|o| o.as_name()) {
+                            if subtype == b"Form" {
                                 return ObjectChange::Permitted(
                                     "form XObject (signature appearance)".into(),
                                 );
                             }
-                            if subtype == "Image" {
+                            if subtype == b"Image" {
                                 // [Shadow] New images added after signing could
                                 // overlay existing content
                                 return ObjectChange::Unauthorized(
@@ -1984,7 +2052,7 @@ impl SignatureValidator {
                             }
                         }
                     }
-                    if type_name == "ObjStm" {
+                    if type_name == b"ObjStm" {
                         // Object stream — could hide shadow content
                         return ObjectChange::Unauthorized(
                             "[Shadow] object stream added after signing".into(),
@@ -2038,12 +2106,12 @@ impl SignatureValidator {
 
         // Check if this is a Page dictionary
         if let (Ok(rev_dict), Ok(full_dict)) = (rev_obj.as_dict(), full_obj.as_dict()) {
-            if let Ok(type_name) = full_dict.get(b"Type").and_then(|o| o.as_name_str()) {
-                match type_name {
-                    "Page" => {
+            if let Ok(type_name) = full_dict.get(b"Type").and_then(|o| o.as_name()) {
+                match &type_name[..] {
+                    b"Page" => {
                         return Self::classify_page_change(rev_dict, full_dict);
                     }
-                    "Pages" => {
+                    b"Pages" => {
                         // [Shadow] Page tree node modified — could be
                         // swapping/reordering pages
                         return ObjectChange::Unauthorized(
@@ -2061,14 +2129,14 @@ impl SignatureValidator {
 
             // [ISA] Form field value change: if this dict has /FT and it's
             // NOT a signature field, changing /V is unauthorized
-            if let Ok(ft) = full_dict.get(b"FT").and_then(|o| o.as_name_str()) {
-                if ft != "Sig" {
+            if let Ok(ft) = full_dict.get(b"FT").and_then(|o| o.as_name()) {
+                if ft != b"Sig" {
                     let rv = rev_dict.get(b"V").ok().map(|v| format!("{:?}", v));
                     let fv = full_dict.get(b"V").ok().map(|v| format!("{:?}", v));
                     if rv != fv {
                         return ObjectChange::Unauthorized(format!(
                             "[ISA] form field /FT /{} value /V changed",
-                            ft
+                            String::from_utf8_lossy(ft)
                         ));
                     }
                 }
@@ -2766,6 +2834,124 @@ mod tests {
 
         assert!(!r.no_unauthorized_modifications, "ISA should be detected");
         assert!(!r.is_valid(), "Tampered PDF should be invalid");
+    }
+
+    // ── Password-protected PDF tests ──
+
+    #[test]
+    fn test_validate_encrypted_pdf_with_correct_password() {
+        let pdf_bytes = match fs::read("examples/assets/sample-signed-encrypted.pdf") {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("Encrypted test PDF not found, skipping");
+                return;
+            }
+        };
+
+        // Verify that we can at least decrypt the PDF without error.
+        // Note: encrypting an already-signed PDF with qpdf may restructure
+        // objects, so signature validation may fail even with correct password.
+        // What we're testing here is the decryption path.
+        let result = SignatureValidator::validate_with_password(&pdf_bytes, Some(b"testpass"));
+
+        eprintln!("=== Encrypted PDF (correct password) ===");
+        match &result {
+            Ok(results) => {
+                assert!(!results.is_empty(), "Should find signatures after decryption");
+                assert!(results[0].is_encrypted, "Should report as encrypted");
+                eprintln!("  is_encrypted: {}", results[0].is_encrypted);
+                eprintln!("  signer: {:?}", results[0].signer_name);
+                eprintln!("  cms_valid: {}", results[0].cms_signature_valid);
+            }
+            Err(e) => {
+                let msg = format!("{}", e);
+                // Decryption should succeed — if the error mentions password/decrypt, that's a real failure
+                assert!(
+                    !msg.contains("password") && !msg.contains("decrypt"),
+                    "Decryption should not fail with correct password: {}", msg
+                );
+                eprintln!("  Decrypted OK but no valid signature fields found (expected for re-encrypted PDFs): {}", msg);
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_encrypted_pdf_with_wrong_password() {
+        let pdf_bytes = match fs::read("examples/assets/sample-signed-encrypted.pdf") {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("Encrypted test PDF not found, skipping");
+                return;
+            }
+        };
+
+        let result = SignatureValidator::validate_with_password(&pdf_bytes, Some(b"wrongpass"));
+        assert!(result.is_err(), "Should fail with wrong password");
+
+        let err_msg = format!("{:?}", result.unwrap_err());
+        eprintln!("=== Encrypted PDF (wrong password) ===");
+        eprintln!("  error: {}", err_msg);
+        assert!(
+            err_msg.contains("incorrect") || err_msg.contains("decrypt"),
+            "Error should mention incorrect password or decryption failure"
+        );
+    }
+
+    #[test]
+    fn test_validate_encrypted_pdf_no_password() {
+        let pdf_bytes = match fs::read("examples/assets/sample-signed-encrypted.pdf") {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("Encrypted test PDF not found, skipping");
+                return;
+            }
+        };
+
+        // No password provided — should fail with a helpful message
+        let result = SignatureValidator::validate(&pdf_bytes);
+        assert!(result.is_err(), "Should fail without password");
+
+        let err_msg = format!("{:?}", result.unwrap_err());
+        eprintln!("=== Encrypted PDF (no password) ===");
+        eprintln!("  error: {}", err_msg);
+        assert!(
+            err_msg.contains("password") || err_msg.contains("encrypted"),
+            "Error should mention password or encryption"
+        );
+    }
+
+    #[test]
+    fn test_validate_owner_encrypted_pdf_auto_decrypts() {
+        // Owner-password-only PDFs have an empty user password and should
+        // auto-decrypt when validate() is called without a password.
+        let pdf_bytes = match fs::read("examples/assets/sample-signed-owner-encrypted.pdf") {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("Owner-encrypted test PDF not found, skipping");
+                return;
+            }
+        };
+
+        let result = SignatureValidator::validate(&pdf_bytes);
+
+        eprintln!("=== Owner-encrypted PDF (auto-decrypt) ===");
+        match &result {
+            Ok(results) => {
+                assert!(!results.is_empty(), "Should find signatures");
+                assert!(results[0].is_encrypted, "Should report as encrypted");
+                eprintln!("  is_encrypted: {}", results[0].is_encrypted);
+                eprintln!("  signer: {:?}", results[0].signer_name);
+            }
+            Err(e) => {
+                let msg = format!("{}", e);
+                // Auto-decryption with empty password should succeed
+                assert!(
+                    !msg.contains("password") && !msg.contains("decrypt") && !msg.contains("encrypted"),
+                    "Owner-only encrypted PDF should auto-decrypt with empty password: {}", msg
+                );
+                eprintln!("  Decrypted OK but structure changed (expected for re-encrypted PDFs): {}", msg);
+            }
+        }
     }
 }
 

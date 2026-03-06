@@ -18,8 +18,8 @@ use crate::rectangle::Rectangle;
 /// Collect all leaf page object-ids in document order by walking the `/Pages` tree.
 fn collect_leaf_pages(doc: &Document, node: ObjectId) -> Result<Vec<ObjectId>, Error> {
     let dict = doc.get_object(node)?.as_dict()?;
-    if let Ok(type_name) = dict.get(b"Type").and_then(|t| t.as_name_str()) {
-        if type_name == "Page" {
+    if let Ok(type_name) = dict.get(b"Type").and_then(|t| t.as_name()) {
+        if type_name == b"Page" {
             return Ok(vec![node]);
         }
     }

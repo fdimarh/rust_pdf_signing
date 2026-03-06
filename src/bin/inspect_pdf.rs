@@ -138,7 +138,7 @@ fn inspect_pdf(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 println!("  Annot: {:?}", ann_ref);
                                 let annot = doc.get_object(ann_ref)?.as_dict()?;
                                 if annot.has(b"Subtype") {
-                                    println!("    Subtype: {}", annot.get(b"Subtype")?.as_name_str()?);
+                                    println!("    Subtype: {}", String::from_utf8_lossy(annot.get(b"Subtype")?.as_name()?));
                                 }
                                 if annot.has(b"P") {
                                     println!("    P: {:?}", annot.get(b"P")?);
@@ -170,12 +170,12 @@ fn inspect_pdf(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     for (id, object) in doc.objects.iter() {
         if let Ok(dict) = object.as_dict() {
             if dict.has(b"Type") {
-                if let Ok(name) = dict.get(b"Type").and_then(|t| t.as_name_str()) {
-                    if name == "Annot" {
+                if let Ok(name) = dict.get(b"Type").and_then(|t| t.as_name()) {
+                    if name == b"Annot" {
                         println!("Found Annot object: {:?}", id);
                         if dict.has(b"Subtype") {
-                            if let Ok(s) = dict.get(b"Subtype").and_then(|t| t.as_name_str()) {
-                                println!("  Subtype: {}", s);
+                            if let Ok(s) = dict.get(b"Subtype").and_then(|t| t.as_name()) {
+                                println!("  Subtype: {}", String::from_utf8_lossy(s));
                             }
                         }
                         if dict.has(b"P") {

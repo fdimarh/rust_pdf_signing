@@ -21,6 +21,7 @@ Built on top of [`lopdf`][lopdf] for PDF manipulation and [`cryptographic-messag
   - **B-LTA** — Long-Term Archival: Adds document-level timestamp on top of B-LT
 - **Visible & Invisible Signatures** — Embed signature images (PNG) at a specified page/position, or sign invisibly
 - **Multi-Signature Support** — Apply multiple signatures via incremental updates (each signer gets their own revision)
+- **Encrypted PDF Support** — Verify signatures in password-protected PDFs (user password and owner-only permission restrictions)
 - **Signature Validation**
   - CMS/PKCS#7 envelope integrity verification
   - SHA-256 digest verification against ByteRange
@@ -80,8 +81,15 @@ for r in &results {
     println!("  Chain trusted:  {}", r.certificate_chain_trusted);
     println!("  No tampering:   {}", r.no_unauthorized_modifications);
     println!("  LTV enabled:    {}", r.is_ltv_enabled);
+    println!("  Encrypted:      {}", r.is_encrypted);
     println!("  Overall valid:  {}", r.is_valid());
 }
+
+// For password-protected PDFs:
+let results = SignatureValidator::validate_with_password(
+    &pdf_bytes,
+    Some(b"mypassword"),
+).unwrap();
 ```
 
 ## CLI Examples
@@ -136,6 +144,29 @@ cargo run --example sign_doc -- first.pdf -o second.pdf --name Bob --invisible
 ```bash
 cargo run --example verify_pdf -- signed.pdf
 ```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--json, -j` | Output results in JSON format |
+| `--password, -P <pass>` | Password for encrypted/protected PDFs |
+| `--help, -h` | Show help |
+
+**Password-protected PDFs:**
+
+```bash
+# Verify encrypted PDF with user password
+cargo run --example verify_pdf -- encrypted-signed.pdf --password mysecret
+
+# JSON output with password
+cargo run --example verify_pdf -- encrypted-signed.pdf -P mysecret --json
+
+# Owner-only encrypted PDFs (permission restrictions only) are auto-decrypted
+cargo run --example verify_pdf -- owner-protected.pdf
+```
+
+> **Note:** PDFs with only an owner password (permission restrictions, no user password) are automatically decrypted without requiring `--password`. Only PDFs with a user password need the `--password` flag.
 
 The verifier checks and reports:
 
@@ -381,6 +412,7 @@ The test suite includes:
 - Modification detection (legitimate changes vs. tampering)
 - PAdES conformance validation
 - **Security attack defenses** (USF ByteRange validation, SWA detection, ISA content stream tampering, EAA annotation filtering)
+- **Encrypted PDF verification** (correct password, wrong password, no password, owner-only auto-decrypt)
 
 ## Dependencies
 

@@ -4,7 +4,7 @@ use lopdf::{
     content::{Content, Operation},
     ObjectId,
 };
-use std::io::Read;
+use std::io::{Cursor, Read};
 
 pub trait InsertImageToPage: InsertImage {
     fn add_xobject<N: Into<Vec<u8>>>(
@@ -31,8 +31,11 @@ pub trait InsertImageToPage: InsertImage {
         page_id: ObjectId,
         rect: Rectangle,
     ) -> Result<ObjectId, Error> {
-        // Load image
-        let image_decoder = png::Decoder::new(image_reader);
+        // Load image — png 0.18 requires BufRead + Seek, so buffer into memory
+        let mut buf = Vec::new();
+        let mut reader = image_reader;
+        reader.read_to_end(&mut buf).map_err(|e| Error::Other(format!("Failed to read image: {}", e)))?;
+        let image_decoder = png::Decoder::new(Cursor::new(buf));
         let (mut image_xobject, mask_xobject) = ImageXObject::try_from(image_decoder)?;
         // Add object to object list
         if let Some(mask_xobject) = mask_xobject {

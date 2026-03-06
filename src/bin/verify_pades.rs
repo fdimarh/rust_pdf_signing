@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let f_ref = match f.as_reference() { Ok(r) => r, Err(_) => continue };
         let f_dict = match doc.get_object(f_ref).and_then(|o| o.as_dict()) { Ok(d) => d, Err(_) => continue };
 
-        let ft = f_dict.get(b"FT").ok().and_then(|o| o.as_name_str().ok().map(|s| s.to_string()));
+        let ft = f_dict.get(b"FT").ok().and_then(|o| o.as_name().ok().map(|s| String::from_utf8_lossy(s).to_string()));
         if ft.as_deref() != Some("Sig") { continue; }
 
         sig_count += 1;
@@ -90,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ── PDF-level checks ──
         // SubFilter
         let sub_filter = v_dict.get(b"SubFilter").ok()
-            .and_then(|o| o.as_name_str().ok().map(|s| s.to_string()));
+            .and_then(|o| o.as_name().ok().map(|s| String::from_utf8_lossy(s).to_string()));
         print!("  [3] SubFilter:                 ");
         match sub_filter.as_deref() {
             Some("ETSI.CAdES.detached") => println!("ETSI.CAdES.detached ✅ (PAdES)"),
@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Filter
         let filter = v_dict.get(b"Filter").ok()
-            .and_then(|o| o.as_name_str().ok().map(|s| s.to_string()));
+            .and_then(|o| o.as_name().ok().map(|s| String::from_utf8_lossy(s).to_string()));
         print!("  [4] Filter:                    ");
         println!("{}", filter.as_deref().unwrap_or("MISSING"));
 

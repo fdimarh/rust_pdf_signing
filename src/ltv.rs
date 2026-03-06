@@ -98,7 +98,7 @@ pub(crate) fn create_ocsp_request(
             issuer_name_hash: Default::default(),
             // TODO
             issuer_key_hash: Default::default(),
-            serial_number: BigInt::from_bytes_le(Sign::Plus, cert.raw_serial()),
+            serial_number: BigInt::from_bytes_le(Sign::Plus, cert.raw_serial()).into(),
         },
         single_request_extensions: None,
     };

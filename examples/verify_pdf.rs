@@ -10,6 +10,7 @@ use std::process;
 struct JsonReport {
     file: String,
     file_size: usize,
+    is_encrypted: bool,
     total_signatures: usize,
     all_valid: bool,
     all_cms_valid: bool,
@@ -171,6 +172,7 @@ impl JsonReport {
         JsonReport {
             file: path.into(),
             file_size,
+            is_encrypted: results.first().map_or(false, |r| r.is_encrypted),
             total_signatures: results.len(),
             all_valid: results.iter().all(|r| r.is_valid()),
             all_cms_valid: results.iter().all(|r| r.cms_signature_valid),
@@ -467,7 +469,7 @@ fn print_result(r: &ValidationResult, index: usize, total_sigs: usize) {
     println!();
 }
 
-fn verify_pdf(path: &str, json_output: bool) {
+fn verify_pdf(path: &str, json_output: bool, password: Option<&str>) {
     let pdf_bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -484,8 +486,12 @@ fn verify_pdf(path: &str, json_output: bool) {
         }
     };
 
-    match SignatureValidator::validate(&pdf_bytes) {
+    let pw_bytes: Option<&[u8]> = password.map(|p| p.as_bytes());
+
+    match SignatureValidator::validate_with_password(&pdf_bytes, pw_bytes) {
         Ok(results) => {
+            let is_encrypted = results.first().map_or(false, |r| r.is_encrypted);
+
             if json_output {
                 let report = JsonReport::from_results(path, pdf_bytes.len(), &results);
                 println!(
@@ -500,7 +506,13 @@ fn verify_pdf(path: &str, json_output: bool) {
                 println!("══════════════════════════════════════════════");
                 println!("  Verifying: {}", path);
                 println!("══════════════════════════════════════════════\n");
-                println!("  File size: {} bytes\n", pdf_bytes.len());
+                println!("  File size: {} bytes", pdf_bytes.len());
+                if is_encrypted {
+                    println!("  Encrypted:  YES 🔒 (decrypted {})",
+                        if password.is_some() { "with provided password" } else { "with empty password" }
+                    );
+                }
+                println!();
                 println!("  Found {} signature(s)\n", results.len());
 
                 for (i, r) in results.iter().enumerate() {
@@ -578,38 +590,77 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     let json_output = args.iter().any(|a| a == "--json" || a == "-j");
-    let files: Vec<&String> = args[1..]
-        .iter()
-        .filter(|a| *a != "--json" && *a != "-j" && *a != "--help" && *a != "-h")
-        .collect();
     let show_help = args.iter().any(|a| a == "--help" || a == "-h");
+
+    // Parse --password <value> or --password=<value>
+    let mut password: Option<String> = None;
+    let mut skip_next = false;
+    for (i, arg) in args.iter().enumerate().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--password" || arg == "-P" {
+            if i + 1 < args.len() {
+                password = Some(args[i + 1].clone());
+                skip_next = true;
+            }
+        } else if let Some(val) = arg.strip_prefix("--password=") {
+            password = Some(val.to_string());
+        }
+    }
+
+    // Collect file paths (filter out option flags and their values)
+    let mut files: Vec<&String> = Vec::new();
+    let mut skip_val = false;
+    for arg in args.iter().skip(1) {
+        if skip_val {
+            skip_val = false;
+            continue;
+        }
+        if arg == "--password" || arg == "-P" {
+            skip_val = true;
+            continue;
+        }
+        if arg.starts_with("--password=") || arg == "--json" || arg == "-j"
+            || arg == "--help" || arg == "-h"
+        {
+            continue;
+        }
+        files.push(arg);
+    }
 
     if show_help {
         eprintln!(
             "Usage: verify_pdf [options] <file.pdf> [file2.pdf ...]
 
 Options:
-  --json, -j    Output results in JSON format
-  --help, -h    Show this help
+  --json, -j              Output results in JSON format
+  --password, -P <pass>   Password for encrypted/protected PDFs
+  --help, -h              Show this help
 
 Examples:
   verify_pdf signed.pdf
   verify_pdf signed.pdf --json
+  verify_pdf encrypted-signed.pdf --password mysecret
+  verify_pdf encrypted-signed.pdf -P mysecret --json
   verify_pdf signed.pdf --json > report.json
   verify_pdf doc1.pdf doc2.pdf"
         );
         return;
     }
 
+    let pw_ref = password.as_deref();
+
     if files.is_empty() {
         if !json_output {
-            println!("Usage: verify_pdf [--json] <file.pdf> [file2.pdf ...]\n");
+            println!("Usage: verify_pdf [--json] [--password <pass>] <file.pdf> [file2.pdf ...]\n");
             println!("No file specified, verifying default: examples/result.pdf\n");
         }
-        verify_pdf("./examples/result.pdf", json_output);
+        verify_pdf("./examples/result.pdf", json_output, pw_ref);
     } else {
         for path in &files {
-            verify_pdf(path, json_output);
+            verify_pdf(path, json_output, pw_ref);
         }
     }
 }

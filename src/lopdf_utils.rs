@@ -1,15 +1,22 @@
 use crate::Error;
 use lopdf::Object;
 
+/// Helper to convert lopdf name bytes to &str
+fn name_to_str(name: &[u8]) -> Result<&str, lopdf::Error> {
+    std::str::from_utf8(name).map_err(|_| lopdf::Error::CharacterEncoding)
+}
+
 pub(crate) fn as_option_name(obj: Option<&Object>) -> Result<Option<String>, Error> {
     Ok(obj
-        .map(|obj| obj.as_name_str())
-        .transpose()?
-        .map(|s| s.to_owned()))
+        .map(|obj| -> Result<String, lopdf::Error> {
+            let name = obj.as_name()?;
+            Ok(name_to_str(name)?.to_owned())
+        })
+        .transpose()?)
 }
 
 pub(crate) fn as_name(obj: Option<&Object>) -> Result<String, Error> {
-    as_option_name(obj)?.ok_or(Error::LoPdfError(lopdf::Error::DictKey))
+    as_option_name(obj)?.ok_or(Error::LoPdfError(lopdf::Error::DictKey("key not found".into())))
 }
 
 pub(crate) fn as_option_byte_string(obj: Option<&Object>) -> Result<Option<Vec<u8>>, Error> {
@@ -20,7 +27,7 @@ pub(crate) fn as_option_byte_string(obj: Option<&Object>) -> Result<Option<Vec<u
 }
 
 pub(crate) fn as_byte_string(obj: Option<&Object>) -> Result<Vec<u8>, Error> {
-    as_option_byte_string(obj)?.ok_or(Error::LoPdfError(lopdf::Error::DictKey))
+    as_option_byte_string(obj)?.ok_or(Error::LoPdfError(lopdf::Error::DictKey("key not found".into())))
 }
 
 pub(crate) fn as_option_integer(obj: Option<&Object>) -> Result<Option<i64>, Error> {
@@ -40,12 +47,12 @@ pub(crate) fn as_option_text_string(obj: Option<&Object>) -> Result<Option<Strin
     let text_string = byte_string
         .map(String::from_utf8)
         .transpose()
-        .map_err(lopdf::Error::from)?;
+        .map_err(|e| lopdf::Error::IO(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
     Ok(text_string)
 }
 
 pub(crate) fn as_array_or_byte_string(obj: Option<&Object>) -> Result<Vec<Vec<u8>>, Error> {
-    let obj = obj.ok_or(Error::LoPdfError(lopdf::Error::DictKey))?;
+    let obj = obj.ok_or(Error::LoPdfError(lopdf::Error::DictKey("key not found".into())))?;
     match obj {
         Object::String(string, _) => Ok(vec![string.to_owned()]),
         Object::Array(list) => {
@@ -55,13 +62,16 @@ pub(crate) fn as_array_or_byte_string(obj: Option<&Object>) -> Result<Vec<Vec<u8
             }
             Ok(result)
         }
-        _ => Err(Error::LoPdfError(lopdf::Error::Type)),
+        _ => Err(Error::LoPdfError(lopdf::Error::ObjectType {
+            expected: "String or Array",
+            found: "other",
+        })),
     }
 }
 
 pub(crate) fn as_byte_range(obj: Option<&Object>) -> Result<Vec<(u64, u64)>, Error> {
     let mut result = Vec::new();
-    let obj = obj.ok_or(Error::LoPdfError(lopdf::Error::DictKey))?;
+    let obj = obj.ok_or(Error::LoPdfError(lopdf::Error::DictKey("key not found".into())))?;
     let list = obj.as_array()?;
     // Temporary store the value of prev loop so we can create pairs.
     let mut temp_item = None;

@@ -3,7 +3,7 @@
 use crate::Error;
 use lopdf::ObjectId;
 use png::{BitDepth, ColorType};
-use std::io::Read;
+use std::io::{BufRead, Seek};
 
 #[derive(Debug, Clone)]
 pub struct ImageXObject {
@@ -28,13 +28,13 @@ impl ImageXObject {
     // TODO: remove `unwrap`s
     /// Returns 1 or 2 images. The first is the color images.
     /// The second is (if present) the mask/alpha channel of the image.
-    pub fn try_from<R: Read>(
+    pub fn try_from<R: BufRead + Seek>(
         image_decoder: png::Decoder<R>,
     ) -> Result<(Self, Option<Self>), Error> {
         // Load image
         let mut image_reader = image_decoder.read_info().unwrap();
         // Allocate the output buffer.
-        let mut buf = vec![0; image_reader.output_buffer_size()];
+        let mut buf = vec![0; image_reader.output_buffer_size().unwrap_or(0)];
         // Read the next frame. An APNG might contain multiple frames.
         let info = image_reader.next_frame(&mut buf).unwrap();
         // Grab the bytes of the image.
