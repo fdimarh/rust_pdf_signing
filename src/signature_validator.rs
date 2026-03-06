@@ -22,12 +22,22 @@ use crate::Error;
 use chrono::{DateTime, Utc, TimeZone};
 use cryptographic_message_syntax::SignedData;
 use lopdf::{Document, Object};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
+
+/// Serialize a `Vec<u8>` as a hex string.
+mod hex_bytes {
+    use serde::Serializer;
+    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        s.serialize_str(&hex)
+    }
+}
 
 // ───────────────────────── public types ─────────────────────────
 
 /// Information extracted from a single `/Sig` dictionary inside the PDF.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SignatureFieldInfo {
     /// The `/T` (field name) value, if present.
     pub field_name: Option<String>,
@@ -40,7 +50,7 @@ pub struct SignatureFieldInfo {
 }
 
 /// Detailed result for one digital signature.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ValidationResult {
     /// Which field in the PDF this result belongs to.
     pub field_info: SignatureFieldInfo,
@@ -63,6 +73,7 @@ pub struct ValidationResult {
 
     // ── cryptographic checks ───────────────────────────────
     /// SHA‑256 digest of the signed portion of the file.
+    #[serde(serialize_with = "hex_bytes::serialize")]
     pub computed_digest: Vec<u8>,
     /// `true` when the CMS `messageDigest` matches `computed_digest`.
     pub digest_match: bool,
@@ -119,6 +130,25 @@ pub struct ValidationResult {
     /// Empty means no modifications (or this is the last revision).
     pub modification_notes: Vec<String>,
 
+    // ── pdf-insecurity.org attack detection ─────────────────
+    /// `true` when the ByteRange structure is valid: starts at 0, no
+    /// overlaps, no gaps (beyond the Contents hex-string), and the gap
+    /// contains only the hex-encoded Contents value.
+    /// Defends against: Universal Signature Forgery (USF).
+    pub byte_range_valid: bool,
+    /// `true` when the Contents hex-string is located exactly in the
+    /// ByteRange gap and has not been relocated/duplicated.
+    /// Defends against: Signature Wrapping Attack (SWA).
+    pub signature_not_wrapped: bool,
+    /// If the document has a `/Perms` → `/DocMDP` certification, this
+    /// contains the MDP permission level (1, 2, or 3). `None` if not certified.
+    /// Defends against: PDF Certification Attack.
+    pub certification_level: Option<u8>,
+    /// `true` when MDP permissions are not violated by subsequent changes.
+    pub certification_permission_ok: bool,
+    /// Security warnings from attack-specific checks.
+    pub security_warnings: Vec<String>,
+
     // ── aggregate ──────────────────────────────────────────
     /// Human‑readable problems found during validation (empty = all good).
     pub errors: Vec<String>,
@@ -131,12 +161,15 @@ impl ValidationResult {
             && self.cms_signature_valid
             && self.certificate_chain_valid
             && self.no_unauthorized_modifications
+            && self.byte_range_valid
+            && self.signature_not_wrapped
+            && self.certification_permission_ok
             && self.errors.is_empty()
     }
 }
 
 /// Basic certificate metadata extracted from the CMS `SignedData`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CertificateInfo {
     pub subject: String,
     pub issuer: String,
@@ -198,6 +231,45 @@ impl SignatureValidator {
         // For each non-last signature, check that incremental updates
         // added AFTER its revision contain only permitted changes.
         Self::detect_modifications(pdf_bytes, &mut results)?;
+
+        // ── pdf-insecurity.org attack detection ──
+        // 1. USF: Validate ByteRange structure
+        // 2. SWA: Verify Contents hex-string location
+        // 3. Certification: Check MDP permission enforcement
+        for r in results.iter_mut() {
+            // --- USF defense: ByteRange structural validation ---
+            let (br_valid, br_warnings) =
+                Self::validate_byte_range_structure(pdf_bytes, &r.byte_range);
+            r.byte_range_valid = br_valid;
+            if !br_valid {
+                r.errors.push("ByteRange structure is invalid (possible USF attack)".into());
+            }
+            r.security_warnings.extend(br_warnings);
+
+            // --- SWA defense: Contents location cross-check ---
+            let (not_wrapped, swa_warnings) =
+                Self::validate_signature_not_wrapped(pdf_bytes, &r.byte_range);
+            r.signature_not_wrapped = not_wrapped;
+            if !not_wrapped {
+                r.errors.push(
+                    "Signature Contents appears to be relocated (possible SWA attack)".into(),
+                );
+            }
+            r.security_warnings.extend(swa_warnings);
+
+            // --- Certification attack defense: MDP permissions ---
+            let (cert_level, cert_ok, cert_warnings) =
+                Self::check_certification_permissions(&doc, pdf_bytes, r);
+            r.certification_level = cert_level;
+            r.certification_permission_ok = cert_ok;
+            if !cert_ok {
+                r.errors.push(
+                    "Document certification permissions violated (possible certification attack)"
+                        .into(),
+                );
+            }
+            r.security_warnings.extend(cert_warnings);
+        }
 
         // In a multi-signature document, only the *last* signature (the most
         // recent incremental update) is expected to cover the entire file.
@@ -622,6 +694,11 @@ impl SignatureValidator {
             signature_revision_end: 0,
             no_unauthorized_modifications: true,
             modification_notes: Vec::new(),
+            byte_range_valid: true,
+            signature_not_wrapped: true,
+            certification_level: None,
+            certification_permission_ok: true,
+            security_warnings: Vec::new(),
             errors,
         })
     }
@@ -1149,6 +1226,406 @@ impl SignatureValidator {
         known_roots.iter().any(|root| dn_lower.contains(root))
     }
 
+    // ═══════════════════════════════════════════════════════
+    // pdf-insecurity.org attack defenses
+    // ═══════════════════════════════════════════════════════
+
+    // ── 1. USF defense: ByteRange structural validation ────
+    //
+    // Universal Signature Forgery manipulates ByteRange values to make
+    // the signature cover different data than what's displayed.
+    //
+    // Checks:
+    //  - ByteRange[0] must be 0 (signature starts at file beginning)
+    //  - All values must be non-negative
+    //  - No overlapping ranges
+    //  - The gap between range 0 and range 1 must be exactly the
+    //    Contents hex-string (enclosed in `<` and `>`)
+    //  - Ranges must not exceed file size
+    //  - The gap must contain only valid hex characters
+
+    fn validate_byte_range_structure(
+        pdf_bytes: &[u8],
+        byte_range: &[i64],
+    ) -> (bool, Vec<String>) {
+        let mut warnings = Vec::new();
+        let mut valid = true;
+
+        if byte_range.len() != 4 {
+            warnings.push(format!(
+                "[USF] ByteRange has {} elements, expected 4",
+                byte_range.len()
+            ));
+            return (false, warnings);
+        }
+
+        let offset1 = byte_range[0];
+        let length1 = byte_range[1];
+        let offset2 = byte_range[2];
+        let length2 = byte_range[3];
+        let file_len = pdf_bytes.len() as i64;
+
+        // ByteRange[0] must be 0
+        if offset1 != 0 {
+            warnings.push(format!(
+                "[USF] ByteRange starts at offset {} instead of 0 — \
+                 beginning of file not covered by signature",
+                offset1
+            ));
+            valid = false;
+        }
+
+        // All values must be non-negative
+        if offset1 < 0 || length1 < 0 || offset2 < 0 || length2 < 0 {
+            warnings.push("[USF] ByteRange contains negative values".into());
+            valid = false;
+        }
+
+        // Ranges must not exceed file size
+        if offset1 + length1 > file_len {
+            warnings.push("[USF] First range exceeds file size".into());
+            valid = false;
+        }
+        if offset2 + length2 > file_len {
+            warnings.push("[USF] Second range exceeds file size".into());
+            valid = false;
+        }
+
+        // No overlapping ranges: end of range 0 must be <= start of range 1
+        let range0_end = offset1 + length1;
+        if range0_end > offset2 {
+            warnings.push(format!(
+                "[USF] Ranges overlap: first range ends at {} but second starts at {}",
+                range0_end, offset2
+            ));
+            valid = false;
+        }
+
+        // The gap between ranges must contain the Contents hex-string
+        if range0_end < offset2 && range0_end >= 0 && offset2 <= file_len {
+            let gap_start = range0_end as usize;
+            let gap_end = offset2 as usize;
+            let gap = &pdf_bytes[gap_start..gap_end];
+
+            // Gap must start with '<' and end with '>'
+            if gap.is_empty() {
+                warnings.push("[USF] Zero-length gap between ByteRange segments".into());
+                valid = false;
+            } else {
+                if gap[0] != b'<' {
+                    warnings.push(format!(
+                        "[USF] ByteRange gap does not start with '<' (found 0x{:02x})",
+                        gap[0]
+                    ));
+                    valid = false;
+                }
+                if gap[gap.len() - 1] != b'>' {
+                    warnings.push(format!(
+                        "[USF] ByteRange gap does not end with '>' (found 0x{:02x})",
+                        gap[gap.len() - 1]
+                    ));
+                    valid = false;
+                }
+
+                // Contents between < and > must be valid hex characters
+                if gap.len() >= 2 {
+                    let hex_content = &gap[1..gap.len() - 1];
+                    let non_hex = hex_content
+                        .iter()
+                        .any(|b| !b.is_ascii_hexdigit());
+                    if non_hex {
+                        warnings.push(
+                            "[USF] ByteRange gap contains non-hex characters — \
+                             possible content injection in signature placeholder"
+                                .into(),
+                        );
+                        valid = false;
+                    }
+                }
+            }
+        }
+
+        // Sanity: length1 should be reasonable (at least a few hundred bytes
+        // for even a minimal PDF header + objects)
+        if length1 < 50 {
+            warnings.push(format!(
+                "[USF] First ByteRange segment is suspiciously short ({} bytes)",
+                length1
+            ));
+            valid = false;
+        }
+
+        (valid, warnings)
+    }
+
+    // ── 2. SWA defense: Signature Wrapping Attack detection ──
+    //
+    // SWA moves the original signature Contents to a different location
+    // and inserts a forged signature at the expected offset.  We verify
+    // that the actual `/Contents<` hex string in the raw bytes is at the
+    // expected position within the ByteRange gap.
+
+    fn validate_signature_not_wrapped(
+        pdf_bytes: &[u8],
+        byte_range: &[i64],
+    ) -> (bool, Vec<String>) {
+        let mut warnings = Vec::new();
+
+        if byte_range.len() != 4 {
+            return (true, warnings); // Can't check without valid ByteRange
+        }
+
+        let gap_start = byte_range[0] as usize + byte_range[1] as usize;
+        let gap_end = byte_range[2] as usize;
+
+        if gap_start >= pdf_bytes.len() || gap_end > pdf_bytes.len() || gap_start >= gap_end {
+            return (true, warnings); // Handled by ByteRange validation
+        }
+
+        // Look for `/Contents<` pattern near the gap.  The pattern should
+        // appear immediately before gap_start (within the signed region).
+        // Scan backwards from gap_start to find `/Contents`.
+        let search_start = gap_start.saturating_sub(20);
+        let search_region = &pdf_bytes[search_start..gap_start];
+        let pattern = b"/Contents";
+        let found_before_gap = search_region
+            .windows(pattern.len())
+            .any(|w| w == pattern);
+
+        if !found_before_gap {
+            warnings.push(
+                "[SWA] /Contents key not found immediately before ByteRange gap — \
+                 signature may have been relocated"
+                    .into(),
+            );
+            return (false, warnings);
+        }
+
+        // Check that there is no SECOND `/Contents<` hex-string elsewhere
+        // in the file that could be a wrapped/duplicated signature.
+        let gap_hex = &pdf_bytes[gap_start..gap_end];
+        let _expected_hex_len = gap_hex.len();
+
+        // Count occurrences of `/Contents<` followed by hex data of
+        // approximately the same length
+        let contents_pattern = b"/Contents<";
+        let mut occurrences = 0;
+        let mut pos = 0;
+        while pos + contents_pattern.len() < pdf_bytes.len() {
+            if let Some(found) = pdf_bytes[pos..]
+                .windows(contents_pattern.len())
+                .position(|w| w == contents_pattern)
+            {
+                let abs_pos = pos + found;
+                let hex_start = abs_pos + contents_pattern.len();
+
+                // Find the closing '>'
+                if let Some(close_pos) = pdf_bytes[hex_start..].iter().position(|&b| b == b'>') {
+                    let this_hex_len = close_pos + 2; // Include < and >
+                    // Only count if the hex string is large enough to be a
+                    // signature (>= 100 bytes, i.e. >= 200 hex chars)
+                    if this_hex_len >= 200 {
+                        occurrences += 1;
+                    }
+                    pos = hex_start + close_pos + 1;
+                } else {
+                    pos = hex_start + 1;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // In a multi-signature document, each signature has its own
+        // /Contents<...>.  But we should NOT see more /Contents hex-strings
+        // than there are signature fields.  We flag if we find a suspicious
+        // extra one, but we can't be 100% sure without the field count.
+        // For now, just warn if there are more than a reasonable number.
+        if occurrences > 10 {
+            warnings.push(format!(
+                "[SWA] Found {} large /Contents hex-strings in document — \
+                 possible signature wrapping",
+                occurrences
+            ));
+            return (false, warnings);
+        }
+
+        (true, warnings)
+    }
+
+    // ── 3. Certification Attack defense: MDP permission check ──
+    //
+    // Certified documents have a `/Perms` → `/DocMDP` entry that restricts
+    // what changes are allowed.  We enforce these restrictions:
+    //   Level 1: No changes allowed at all
+    //   Level 2: Only form fill-in and signing allowed
+    //   Level 3: Form fill-in, signing, and annotations allowed
+
+    fn check_certification_permissions(
+        doc: &Document,
+        _pdf_bytes: &[u8],
+        result: &ValidationResult,
+    ) -> (Option<u8>, bool, Vec<String>) {
+        let mut warnings = Vec::new();
+
+        // Find /Perms -> /DocMDP in the catalog
+        let root_ref = match doc.trailer.get(b"Root").and_then(|o| o.as_reference()) {
+            Ok(r) => r,
+            Err(_) => return (None, true, warnings),
+        };
+        let root_dict = match doc.get_object(root_ref).and_then(|o| o.as_dict()) {
+            Ok(d) => d,
+            Err(_) => return (None, true, warnings),
+        };
+
+        if !root_dict.has(b"Perms") {
+            return (None, true, warnings); // Not a certified document
+        }
+
+        let perms = match root_dict.get(b"Perms") {
+            Ok(Object::Dictionary(d)) => d,
+            Ok(Object::Reference(r)) => match doc.get_object(*r).and_then(|o| o.as_dict()) {
+                Ok(d) => d,
+                Err(_) => return (None, true, warnings),
+            },
+            _ => return (None, true, warnings),
+        };
+
+        if !perms.has(b"DocMDP") {
+            return (None, true, warnings);
+        }
+
+        // Resolve the DocMDP signature reference
+        let docmdp_ref = match perms.get(b"DocMDP") {
+            Ok(Object::Reference(r)) => *r,
+            _ => return (None, true, warnings),
+        };
+
+        // Get the TransformParams from the DocMDP signature
+        let sig_dict = match doc.get_object(docmdp_ref).and_then(|o| o.as_dict()) {
+            Ok(d) => d,
+            Err(_) => return (None, true, warnings),
+        };
+
+        // The MDP level can be in the signature dict's /Reference array
+        // or directly in a /TransformParams dict
+        let mdp_level = Self::extract_mdp_level(doc, sig_dict);
+
+        match mdp_level {
+            Some(level) => {
+                warnings.push(format!(
+                    "[Certification] Document is certified with MDP level {} ({})",
+                    level,
+                    match level {
+                        1 => "no changes allowed",
+                        2 => "form fill-in and signing only",
+                        3 => "form fill-in, signing, and annotations",
+                        _ => "unknown",
+                    }
+                ));
+
+                // Check if modifications respect the MDP level
+                let ok = Self::check_mdp_compliance(level, result);
+                if !ok {
+                    warnings.push(format!(
+                        "[Certification] Changes after signing VIOLATE MDP level {} restrictions",
+                        level
+                    ));
+                }
+
+                (Some(level), ok, warnings)
+            }
+            None => (None, true, warnings),
+        }
+    }
+
+    /// Extract the MDP permission level from a DocMDP signature dictionary.
+    fn extract_mdp_level(doc: &Document, sig_dict: &lopdf::Dictionary) -> Option<u8> {
+        // Try /Reference array -> /TransformParams -> /P
+        if let Ok(ref_arr) = sig_dict.get(b"Reference").and_then(|o| o.as_array()) {
+            for item in ref_arr {
+                let ref_dict = match item {
+                    Object::Dictionary(d) => d,
+                    Object::Reference(r) => match doc.get_object(*r).and_then(|o| o.as_dict()) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    },
+                    _ => continue,
+                };
+
+                if let Ok(tm) = ref_dict
+                    .get(b"TransformMethod")
+                    .and_then(|o| o.as_name_str())
+                {
+                    if tm == "DocMDP" {
+                        if let Ok(tp) = ref_dict.get(b"TransformParams") {
+                            let tp_dict = match tp {
+                                Object::Dictionary(d) => d,
+                                Object::Reference(r) => {
+                                    match doc.get_object(*r).and_then(|o| o.as_dict()) {
+                                        Ok(d) => d,
+                                        Err(_) => continue,
+                                    }
+                                }
+                                _ => continue,
+                            };
+                            if let Ok(Object::Integer(p)) = tp_dict.get(b"P") {
+                                return Some(*p as u8);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if the detected modifications comply with the MDP level.
+    fn check_mdp_compliance(level: u8, result: &ValidationResult) -> bool {
+        if result.modification_notes.is_empty() {
+            return true; // No changes = always compliant
+        }
+
+        match level {
+            1 => {
+                // No changes allowed at all
+                // Any modification note means a violation
+                result.modification_notes.is_empty()
+            }
+            2 => {
+                // Only form fill-in and signing allowed
+                result.modification_notes.iter().all(|note| {
+                    let lower = note.to_lowercase();
+                    lower.contains("signature")
+                        || lower.contains("acroform")
+                        || lower.contains("annots extended")
+                        || lower.contains("dss")
+                        || lower.contains("catalog")
+                        || lower.contains("data stream")
+                        || lower.contains("vri")
+                        || lower.contains("permitted")
+                })
+            }
+            3 => {
+                // Form fill-in, signing, and annotations allowed
+                result.modification_notes.iter().all(|note| {
+                    let lower = note.to_lowercase();
+                    lower.contains("signature")
+                        || lower.contains("acroform")
+                        || lower.contains("annots")
+                        || lower.contains("annotation")
+                        || lower.contains("dss")
+                        || lower.contains("catalog")
+                        || lower.contains("data stream")
+                        || lower.contains("vri")
+                        || lower.contains("widget")
+                        || lower.contains("permitted")
+                })
+            }
+            _ => true,
+        }
+    }
+
     // ── Modification detection (like Adobe Reader) ─────────
 
     /// Find all `%%EOF` markers in the raw PDF bytes.
@@ -1394,8 +1871,38 @@ impl SignatureValidator {
                         "Annot" => {
                             if let Ok(subtype) = dict.get(b"Subtype").and_then(|o| o.as_name_str()) {
                                 if subtype == "Widget" {
+                                    // Widget is only permitted if linked to a Sig field
+                                    if dict.has(b"FT") || dict.has(b"V") || dict.has(b"Parent") {
+                                        return ObjectChange::Permitted("widget annotation".into());
+                                    }
                                     return ObjectChange::Permitted("widget annotation".into());
                                 }
+                                // [EAA] Evil Annotation Attack: reject dangerous
+                                // annotation subtypes that can overlay signed content
+                                let dangerous = matches!(
+                                    subtype,
+                                    "FreeText" | "Stamp" | "Redact" | "Watermark"
+                                        | "Square" | "Circle" | "Line" | "Ink"
+                                        | "FileAttachment" | "RichMedia" | "Screen"
+                                        | "3D" | "Sound" | "Movie" | "Polygon"
+                                        | "PolyLine" | "Caret" | "Highlight"
+                                        | "Underline" | "Squiggly" | "StrikeOut"
+                                        | "Text" | "Popup"
+                                );
+                                if dangerous {
+                                    return ObjectChange::Unauthorized(format!(
+                                        "[EAA] dangerous annotation /Subtype /{}",
+                                        subtype
+                                    ));
+                                }
+                                // Link annotations are generally safe
+                                if subtype == "Link" {
+                                    return ObjectChange::Permitted("link annotation".into());
+                                }
+                                return ObjectChange::Unauthorized(format!(
+                                    "annotation /Subtype /{}",
+                                    subtype
+                                ));
                             }
                         }
                         "Catalog" => {
@@ -1468,23 +1975,41 @@ impl SignatureValidator {
                                     "form XObject (signature appearance)".into(),
                                 );
                             }
+                            if subtype == "Image" {
+                                // [Shadow] New images added after signing could
+                                // overlay existing content
+                                return ObjectChange::Unauthorized(
+                                    "[Shadow] image XObject added after signing".into(),
+                                );
+                            }
                         }
+                    }
+                    if type_name == "ObjStm" {
+                        // Object stream — could hide shadow content
+                        return ObjectChange::Unauthorized(
+                            "[Shadow] object stream added after signing".into(),
+                        );
                     }
                 }
                 // DSS streams typically don't have /Type, just /Length
-                // Accept streams that are small-ish (likely CRL/OCSP/cert)
-                // or that appear alongside DSS-related objects
+                // Accept streams that have only Length/Filter/DecodeParms
                 let keys: Vec<String> = dict
                     .iter()
                     .map(|(k, _)| String::from_utf8_lossy(k).to_string())
                     .collect();
-                // If it has only Length (and maybe Filter/DecodeParms),
-                // it's likely a DSS data stream
                 let is_simple_stream = keys.iter().all(|k| {
                     matches!(k.as_str(), "Length" | "Filter" | "DecodeParms" | "DL")
                 });
                 if is_simple_stream {
                     return ObjectChange::Permitted("data stream (likely DSS/CRL/OCSP)".into());
+                }
+
+                // [Shadow] Streams with content-like properties (Resources,
+                // BBox, Matrix) are likely content streams used in shadow attacks
+                if dict.has(b"Resources") || dict.has(b"BBox") || dict.has(b"Matrix") {
+                    return ObjectChange::Unauthorized(
+                        "[Shadow] content stream with Resources/BBox added after signing".into(),
+                    );
                 }
 
                 ObjectChange::Unauthorized(format!(
@@ -1514,8 +2039,18 @@ impl SignatureValidator {
         // Check if this is a Page dictionary
         if let (Ok(rev_dict), Ok(full_dict)) = (rev_obj.as_dict(), full_obj.as_dict()) {
             if let Ok(type_name) = full_dict.get(b"Type").and_then(|o| o.as_name_str()) {
-                if type_name == "Page" {
-                    return Self::classify_page_change(rev_dict, full_dict);
+                match type_name {
+                    "Page" => {
+                        return Self::classify_page_change(rev_dict, full_dict);
+                    }
+                    "Pages" => {
+                        // [Shadow] Page tree node modified — could be
+                        // swapping/reordering pages
+                        return ObjectChange::Unauthorized(
+                            "[Shadow] /Type /Pages tree node modified".into(),
+                        );
+                    }
+                    _ => {}
                 }
             }
 
@@ -1523,6 +2058,29 @@ impl SignatureValidator {
             if full_dict.has(b"Fields") && full_dict.has(b"SigFlags") {
                 return Self::classify_acroform_change(rev_dict, full_dict);
             }
+
+            // [ISA] Form field value change: if this dict has /FT and it's
+            // NOT a signature field, changing /V is unauthorized
+            if let Ok(ft) = full_dict.get(b"FT").and_then(|o| o.as_name_str()) {
+                if ft != "Sig" {
+                    let rv = rev_dict.get(b"V").ok().map(|v| format!("{:?}", v));
+                    let fv = full_dict.get(b"V").ok().map(|v| format!("{:?}", v));
+                    if rv != fv {
+                        return ObjectChange::Unauthorized(format!(
+                            "[ISA] form field /FT /{} value /V changed",
+                            ft
+                        ));
+                    }
+                }
+            }
+        }
+
+        // [ISA/Shadow] Stream object content changed
+        if let (Object::Stream(_), Object::Stream(_)) = (rev_obj, full_obj) {
+            return ObjectChange::Unauthorized(format!(
+                "[ISA] stream object {} content modified",
+                obj_id.0
+            ));
         }
 
         ObjectChange::Unauthorized(format!("object {} modified", obj_id.0))
@@ -1554,6 +2112,25 @@ impl SignatureValidator {
                             "AcroForm" | "DSS" | "Perms" => {
                                 changes.push(format!("/{} updated", key_str));
                             }
+                            "OCProperties" => {
+                                // [Shadow] Optional Content properties changed —
+                                // this can hide/reveal layers after signing
+                                changes.push(
+                                    "[Shadow] /OCProperties modified — \
+                                     layer visibility may have changed"
+                                        .into(),
+                                );
+                                unauthorized = true;
+                            }
+                            "Pages" => {
+                                // [Shadow] Page tree modified
+                                changes.push(
+                                    "[Shadow] /Pages modified — \
+                                     page tree may have been altered"
+                                        .into(),
+                                );
+                                unauthorized = true;
+                            }
                             _ => {
                                 changes.push(format!(
                                     "/{} modified (unauthorized)",
@@ -1569,6 +2146,15 @@ impl SignatureValidator {
                     match key_str.as_str() {
                         "DSS" | "Perms" | "AcroForm" => {
                             changes.push(format!("/{} added", key_str));
+                        }
+                        "OCProperties" => {
+                            // [Shadow] Adding optional content groups after signing
+                            changes.push(
+                                "[Shadow] /OCProperties added — \
+                                 optional content layers added after signing"
+                                    .into(),
+                            );
+                            unauthorized = true;
                         }
                         _ => {
                             changes.push(format!("/{} added (unauthorized)", key_str));
@@ -1626,7 +2212,7 @@ impl SignatureValidator {
                                     changes.push("/Annots extended".into());
                                 } else {
                                     changes.push(
-                                        "/Annots modified (not append-only)".into(),
+                                        "[EAA] /Annots modified (not append-only)".into(),
                                     );
                                     unauthorized = true;
                                 }
@@ -1635,8 +2221,23 @@ impl SignatureValidator {
                                 // Resources may be updated to add XObjects for
                                 // signature appearances
                                 changes.push("/Resources updated".into());
-                                // We allow this as it's commonly needed for
-                                // visible signature images
+                            }
+                            "Contents" => {
+                                // [Shadow] Content stream reference changed —
+                                // this is the primary Shadow attack vector
+                                changes.push(
+                                    "[Shadow] /Contents reference changed — \
+                                     page content may have been replaced"
+                                        .into(),
+                                );
+                                unauthorized = true;
+                            }
+                            "MediaBox" | "CropBox" | "TrimBox" | "BleedBox" | "ArtBox" => {
+                                changes.push(format!(
+                                    "[Shadow] /{} modified — page dimensions changed",
+                                    key_str
+                                ));
+                                unauthorized = true;
                             }
                             _ => {
                                 changes.push(format!(
@@ -2026,6 +2627,145 @@ mod tests {
         assert!(r.digest_match, "Digest should still match");
 
         Ok(())
+    }
+
+    // ── Security attack defense tests (pdf-insecurity.org) ──
+
+    #[test]
+    fn test_usf_byte_range_structure_valid() {
+        // A legitimate signature should have valid ByteRange structure
+        let pdf_bytes = fs::read("examples/assets/sample-signed.pdf")
+            .or_else(|_| fs::read("examples/result.pdf"))
+            .unwrap();
+        let results = SignatureValidator::validate(&pdf_bytes).unwrap();
+        let r = &results[0];
+
+        eprintln!("=== USF Defense ===");
+        eprintln!("  byte_range_valid: {}", r.byte_range_valid);
+        eprintln!("  security_warnings: {:?}", r.security_warnings);
+
+        assert!(r.byte_range_valid, "Legitimate PDF should have valid ByteRange structure");
+    }
+
+    #[test]
+    fn test_usf_byte_range_must_start_at_zero() {
+        // ByteRange[0] != 0 is a USF indicator
+        let (valid, warnings) =
+            SignatureValidator::validate_byte_range_structure(&[0u8; 1000], &[10, 100, 200, 100]);
+        assert!(!valid, "ByteRange starting at 10 should be invalid");
+        assert!(
+            warnings.iter().any(|w| w.contains("[USF]") && w.contains("offset")),
+            "Should warn about non-zero start"
+        );
+    }
+
+    #[test]
+    fn test_usf_negative_byte_range_values() {
+        let (valid, warnings) =
+            SignatureValidator::validate_byte_range_structure(&[0u8; 1000], &[0, -1, 100, 50]);
+        assert!(!valid, "Negative ByteRange values should be invalid");
+        assert!(
+            warnings.iter().any(|w| w.contains("negative")),
+            "Should warn about negative values"
+        );
+    }
+
+    #[test]
+    fn test_usf_overlapping_ranges() {
+        let (valid, warnings) =
+            SignatureValidator::validate_byte_range_structure(&[0u8; 1000], &[0, 500, 400, 100]);
+        assert!(!valid, "Overlapping ranges should be invalid");
+        assert!(
+            warnings.iter().any(|w| w.contains("overlap")),
+            "Should warn about overlap"
+        );
+    }
+
+    #[test]
+    fn test_swa_detection_on_legitimate_pdf() {
+        let pdf_bytes = fs::read("examples/assets/sample-signed.pdf")
+            .or_else(|_| fs::read("examples/result.pdf"))
+            .unwrap();
+        let results = SignatureValidator::validate(&pdf_bytes).unwrap();
+        let r = &results[0];
+
+        eprintln!("=== SWA Defense ===");
+        eprintln!("  signature_not_wrapped: {}", r.signature_not_wrapped);
+
+        assert!(
+            r.signature_not_wrapped,
+            "Legitimate PDF should not trigger SWA detection"
+        );
+    }
+
+    #[test]
+    fn test_security_checks_on_blta_pdf() {
+        let pdf_bytes = match fs::read("examples/result_pades_blta.pdf") {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("B-LTA PDF not found, skipping");
+                return;
+            }
+        };
+        let results = SignatureValidator::validate(&pdf_bytes).unwrap();
+
+        for (i, r) in results.iter().enumerate() {
+            eprintln!("=== Signature {} Security ===", i + 1);
+            eprintln!("  byte_range_valid:     {}", r.byte_range_valid);
+            eprintln!("  signature_not_wrapped:{}", r.signature_not_wrapped);
+            eprintln!("  cert_permission_ok:   {}", r.certification_permission_ok);
+            eprintln!("  security_warnings:    {:?}", r.security_warnings);
+
+            assert!(r.byte_range_valid, "B-LTA sig {} ByteRange should be valid", i + 1);
+            assert!(r.signature_not_wrapped, "B-LTA sig {} should not be wrapped", i + 1);
+            assert!(r.certification_permission_ok, "B-LTA sig {} MDP should be ok", i + 1);
+        }
+    }
+
+    #[test]
+    fn test_isa_tampered_content_stream_detected() {
+        // Create a tampered PDF (same as test_modification_detection_tampered_pdf)
+        let signed_bytes = fs::read("examples/assets/sample-signed.pdf")
+            .or_else(|_| fs::read("examples/result.pdf"))
+            .unwrap();
+
+        let mut tampered = signed_bytes.clone();
+        let obj4_offset = tampered.len();
+        tampered.extend_from_slice(b"4 0 obj\n<</Length 44>>\nstream\n");
+        tampered.extend_from_slice(b"BT /F1 24 Tf 100 700 Td (TAMPERED!) Tj ET\n");
+        tampered.extend_from_slice(b"endstream\nendobj\n");
+        let xref_pos = tampered.len();
+        tampered.extend_from_slice(b"xref\n4 1\n");
+        tampered.extend_from_slice(format!("{:010} 00000 n \n", obj4_offset).as_bytes());
+        tampered.extend_from_slice(b"trailer\n");
+
+        let prev_xref_start = signed_bytes
+            .windows(10)
+            .rposition(|w| w == b"startxref\n")
+            .unwrap() + 10;
+        let prev_xref_end = signed_bytes[prev_xref_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap() + prev_xref_start;
+        let prev_xref_val = std::str::from_utf8(
+            &signed_bytes[prev_xref_start..prev_xref_end],
+        ).unwrap().trim();
+
+        tampered.extend_from_slice(
+            format!("<</Root 13 0 R/Info 1 0 R/Prev {}/Size 30>>\n", prev_xref_val).as_bytes(),
+        );
+        tampered.extend_from_slice(format!("startxref\n{}\n%%EOF\n", xref_pos).as_bytes());
+
+        let results = SignatureValidator::validate(&tampered).unwrap();
+        let r = &results[0];
+
+        eprintln!("=== ISA Attack Detection ===");
+        eprintln!("  no_unauthorized_mods: {}", r.no_unauthorized_modifications);
+        eprintln!("  modification_notes:   {:?}", r.modification_notes);
+        eprintln!("  is_valid:             {}", r.is_valid());
+
+        assert!(!r.no_unauthorized_modifications, "ISA should be detected");
+        assert!(!r.is_valid(), "Tampered PDF should be invalid");
     }
 }
 

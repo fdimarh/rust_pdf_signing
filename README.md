@@ -29,6 +29,13 @@ Built on top of [`lopdf`][lopdf] for PDF manipulation and [`cryptographic-messag
   - **Modification detection** — Detects unauthorized changes after signing (content tampering, object deletion) while allowing permitted changes (new signatures, DSS, annotations)
   - LTV (Long-Term Validation) status checking
   - Document timestamp (RFC 3161) verification
+- **Security Attack Defenses** ([pdf-insecurity.org](https://pdf-insecurity.org))
+  - **USF** (Universal Signature Forgery) — ByteRange structural validation
+  - **SWA** (Signature Wrapping Attack) — Contents hex-string location cross-check
+  - **ISA** (Incremental Saving Attack) — Revision comparison with change classification
+  - **Shadow Attack** — Content reference swap, OCG visibility, and page tree detection
+  - **EAA** (Evil Annotation Attack) — Dangerous annotation type filtering
+  - **Certification Attack** — MDP permission level enforcement
 - **DSS (Document Security Store)** — Embeds CRL, OCSP responses, and CA certificates at the document level for offline validation
 - **LTV Support** — Embeds revocation data for long-term signature verification
 
@@ -138,6 +145,7 @@ The verifier checks and reports:
 - ✅ Unauthorized modification detection (like Adobe Reader)
 - ✅ LTV status (DSS, CRL, OCSP, timestamps)
 - ✅ Document timestamp verification (RFC 3161)
+- 🛡️ **Security attack detection** (USF, SWA, ISA, Shadow, EAA, Certification attacks)
 
 **Example output:**
 
@@ -221,6 +229,88 @@ The validator distinguishes between **chain validity** (structural consistency) 
 
 Recognized root CAs include DigiCert, GlobalSign, Let's Encrypt, Comodo/Sectigo, Entrust, Google Trust Services, Amazon, and many others.
 
+### Security Attack Defenses (pdf-insecurity.org)
+
+The validator includes defenses against all six known PDF signature attack classes documented by researchers at [pdf-insecurity.org](https://pdf-insecurity.org):
+
+#### 1. Universal Signature Forgery (USF)
+
+**Attack**: Manipulates ByteRange values to make the signature cover different data than what's displayed.
+
+**Defense** (`byte_range_valid`):
+- ByteRange must start at offset 0 (covers file beginning)
+- All values must be non-negative
+- No overlapping ranges
+- Gap between ranges must contain only a valid hex-encoded Contents string (`<hex...>`)
+- Ranges must not exceed file size
+- First range must be reasonably sized (not suspiciously short)
+
+#### 2. Signature Wrapping Attack (SWA)
+
+**Attack**: Moves the original signature to a different location and inserts a forged signature at the expected offset.
+
+**Defense** (`signature_not_wrapped`):
+- Verifies `/Contents<` pattern appears immediately before the ByteRange gap
+- Detects suspicious duplication of large `/Contents<hex>` strings in the file
+
+#### 3. Incremental Saving Attack (ISA)
+
+**Attack**: Appends malicious incremental updates after signing that change visible content.
+
+**Defense** (`no_unauthorized_modifications`):
+- Compares PDF object state between each signature's revision and the final document
+- Classifies every new, modified, and deleted object
+- Detects content stream replacement (`[ISA]` tag)
+- Detects form field value changes on non-signature fields (`[ISA]` tag)
+- Only permits: new signature fields, DSS/VRI data, AcroForm field list extensions, page annotation extensions
+
+#### 4. Shadow Attack
+
+**Attack**: Prepares hidden content that gets revealed after signing (hide, replace, or hide-and-replace variants).
+
+**Defense** (tagged `[Shadow]` in modification notes):
+- Detects `/Contents` reference changes on pages (content stream swap)
+- Detects `/OCProperties` changes (optional content group visibility manipulation)
+- Detects `/Pages` tree modifications (page reordering/swapping)
+- Detects `/MediaBox`/`/CropBox` changes (page dimension manipulation)
+- Flags new image XObjects added after signing
+- Flags new content streams with `/Resources`/`/BBox` (overlay content)
+- Flags new object streams (`/ObjStm`) that could hide shadow content
+
+#### 5. Evil Annotation Attack (EAA)
+
+**Attack**: Adds annotations after signing that overlay or obscure original content.
+
+**Defense** (tagged `[EAA]` in modification notes):
+- Only permits `/Subtype /Widget` annotations (signature field widgets)
+- Explicitly rejects dangerous annotation types: `FreeText`, `Stamp`, `Redact`, `Watermark`, `Square`, `Circle`, `Line`, `Ink`, `FileAttachment`, `RichMedia`, `Screen`, `3D`, `Sound`, `Movie`, `Text`, `Highlight`, `Underline`, `StrikeOut`, and others
+- Detects non-append-only `/Annots` modifications (existing annotations changed/removed)
+
+#### 6. PDF Certification Attack
+
+**Attack**: Exploits certified documents (MDP level) to bypass permission restrictions.
+
+**Defense** (`certification_permission_ok`):
+- Reads `/Perms` → `/DocMDP` from the catalog
+- Extracts MDP permission level from `/TransformParams`/`/P`
+- Enforces restrictions based on level:
+  - **Level 1**: No changes allowed — any modification is a violation
+  - **Level 2**: Only form fill-in and signing — rejects content/annotation changes
+  - **Level 3**: Form fill-in, signing, and annotations — rejects content changes
+
+#### Security fields in `ValidationResult`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `byte_range_valid` | `bool` | ByteRange structure is valid (USF defense) |
+| `signature_not_wrapped` | `bool` | Signature not relocated (SWA defense) |
+| `no_unauthorized_modifications` | `bool` | No unauthorized changes (ISA/Shadow/EAA defense) |
+| `certification_level` | `Option<u8>` | MDP level if document is certified |
+| `certification_permission_ok` | `bool` | MDP permissions respected |
+| `security_warnings` | `Vec<String>` | Detailed security warnings |
+
+All security checks affect `is_valid()` — a signature is considered invalid if any attack indicator is triggered.
+
 ## PAdES Conformance Levels
 
 | Level | Description | What's Added |
@@ -290,6 +380,7 @@ The test suite includes:
 - Certificate chain trust warning verification
 - Modification detection (legitimate changes vs. tampering)
 - PAdES conformance validation
+- **Security attack defenses** (USF ByteRange validation, SWA detection, ISA content stream tampering, EAA annotation filtering)
 
 ## Dependencies
 

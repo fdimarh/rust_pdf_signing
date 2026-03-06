@@ -1,6 +1,185 @@
 use pdf_signing::signature_validator::{SignatureValidator, ValidationResult};
+use serde::Serialize;
 use std::env;
 use std::process;
+
+// ── JSON output structures ─────────────────────────────────
+
+/// Top-level JSON output for a single PDF verification.
+#[derive(Serialize)]
+struct JsonReport {
+    file: String,
+    file_size: usize,
+    total_signatures: usize,
+    all_valid: bool,
+    all_cms_valid: bool,
+    all_digests_match: bool,
+    all_chains_trusted: bool,
+    signatures: Vec<JsonSignatureResult>,
+}
+
+/// JSON output for one signature within a PDF.
+#[derive(Serialize)]
+struct JsonSignatureResult {
+    index: usize,
+    is_valid: bool,
+    signature_type: String,
+
+    // metadata
+    filter: Option<String>,
+    sub_filter: Option<String>,
+    format_label: String,
+    signer_name: Option<String>,
+    contact_info: Option<String>,
+    reason: Option<String>,
+    signing_time: Option<String>,
+
+    // byte range
+    byte_range: Vec<i64>,
+    byte_range_covers_whole_file: bool,
+
+    // cryptographic
+    digest_match: bool,
+    cms_signature_valid: bool,
+    computed_digest: String,
+
+    // certificate chain
+    certificate_chain_valid: bool,
+    certificate_chain_trusted: bool,
+    chain_warnings: Vec<String>,
+    certificates: Vec<JsonCertificate>,
+
+    // ltv
+    is_ltv_enabled: bool,
+    has_timestamp: bool,
+    has_dss: bool,
+    dss_crl_count: usize,
+    dss_ocsp_count: usize,
+    dss_cert_count: usize,
+    has_vri: bool,
+    has_cms_revocation_data: bool,
+
+    // modification detection
+    no_unauthorized_modifications: bool,
+    modification_notes: Vec<String>,
+
+    // security (pdf-insecurity.org)
+    byte_range_valid: bool,
+    signature_not_wrapped: bool,
+    certification_level: Option<u8>,
+    certification_permission_ok: bool,
+    security_warnings: Vec<String>,
+
+    // errors
+    errors: Vec<String>,
+}
+
+/// JSON output for one certificate.
+#[derive(Serialize)]
+struct JsonCertificate {
+    subject: String,
+    issuer: String,
+    serial_number: String,
+    not_before: Option<String>,
+    not_after: Option<String>,
+    is_expired: bool,
+    is_self_signed: bool,
+}
+
+impl JsonReport {
+    fn from_results(path: &str, file_size: usize, results: &[ValidationResult]) -> Self {
+        let signatures: Vec<JsonSignatureResult> = results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let sig_type = if r.field_info.is_document_timestamp {
+                    "Document Timestamp"
+                } else {
+                    "Digital Signature"
+                };
+                let sub_filter_str = r.sub_filter.as_deref().unwrap_or("unknown");
+                let format_label = match sub_filter_str {
+                    "adbe.pkcs7.detached" => "PKCS#7 (pre-PAdES / Adobe legacy)",
+                    "ETSI.CAdES.detached" => "PAdES (CAdES-based, ETSI standard)",
+                    "ETSI.RFC3161" => "RFC 3161 Document Timestamp",
+                    _ => sub_filter_str,
+                };
+                let digest_hex: String = r
+                    .computed_digest
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
+
+                let certificates: Vec<JsonCertificate> = r
+                    .certificates
+                    .iter()
+                    .map(|c| JsonCertificate {
+                        subject: c.subject.clone(),
+                        issuer: c.issuer.clone(),
+                        serial_number: c.serial_number.clone(),
+                        not_before: c
+                            .not_before
+                            .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+                        not_after: c
+                            .not_after
+                            .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+                        is_expired: c.is_expired,
+                        is_self_signed: c.is_self_signed,
+                    })
+                    .collect();
+
+                JsonSignatureResult {
+                    index: i + 1,
+                    is_valid: r.is_valid(),
+                    signature_type: sig_type.into(),
+                    filter: r.filter.clone(),
+                    sub_filter: r.sub_filter.clone(),
+                    format_label: format_label.into(),
+                    signer_name: r.signer_name.clone(),
+                    contact_info: r.contact_info.clone(),
+                    reason: r.reason.clone(),
+                    signing_time: r.signing_time.clone(),
+                    byte_range: r.byte_range.clone(),
+                    byte_range_covers_whole_file: r.byte_range_covers_whole_file,
+                    digest_match: r.digest_match,
+                    cms_signature_valid: r.cms_signature_valid,
+                    computed_digest: digest_hex,
+                    certificate_chain_valid: r.certificate_chain_valid,
+                    certificate_chain_trusted: r.certificate_chain_trusted,
+                    chain_warnings: r.chain_warnings.clone(),
+                    certificates,
+                    is_ltv_enabled: r.is_ltv_enabled,
+                    has_timestamp: r.has_timestamp,
+                    has_dss: r.has_dss,
+                    dss_crl_count: r.dss_crl_count,
+                    dss_ocsp_count: r.dss_ocsp_count,
+                    dss_cert_count: r.dss_cert_count,
+                    has_vri: r.has_vri,
+                    has_cms_revocation_data: r.has_cms_revocation_data,
+                    no_unauthorized_modifications: r.no_unauthorized_modifications,
+                    modification_notes: r.modification_notes.clone(),
+                    byte_range_valid: r.byte_range_valid,
+                    signature_not_wrapped: r.signature_not_wrapped,
+                    certification_level: r.certification_level,
+                    certification_permission_ok: r.certification_permission_ok,
+                    security_warnings: r.security_warnings.clone(),
+                    errors: r.errors.clone(),
+                }
+            })
+            .collect();
+
+        JsonReport {
+            file: path.into(),
+            file_size,
+            total_signatures: results.len(),
+            all_valid: results.iter().all(|r| r.is_valid()),
+            all_cms_valid: results.iter().all(|r| r.cms_signature_valid),
+            all_digests_match: results.iter().all(|r| r.digest_match),
+            all_chains_trusted: results.iter().all(|r| r.certificate_chain_trusted),
+            signatures,
+        }
+    }
+}
 
 fn print_result(r: &ValidationResult, index: usize, total_sigs: usize) {
     let status = if r.is_valid() { "✅ VALID" } else { "❌ INVALID" };
@@ -210,6 +389,51 @@ fn print_result(r: &ValidationResult, index: usize, total_sigs: usize) {
     }
     println!();
 
+    // Security checks (pdf-insecurity.org defenses)
+    println!(
+        "  ByteRange integrity: {}",
+        if r.byte_range_valid {
+            "valid ✅"
+        } else {
+            "INVALID ❌ (possible USF attack)"
+        }
+    );
+    println!(
+        "  Signature wrapping:  {}",
+        if r.signature_not_wrapped {
+            "not detected ✅"
+        } else {
+            "POSSIBLE SWA DETECTED ❌"
+        }
+    );
+    if let Some(level) = r.certification_level {
+        println!(
+            "  Certification:       MDP level {} — {}",
+            level,
+            match level {
+                1 => "no changes allowed",
+                2 => "form fill-in and signing only",
+                3 => "form fill-in, signing, and annotations",
+                _ => "unknown",
+            }
+        );
+        println!(
+            "  MDP compliance:      {}",
+            if r.certification_permission_ok {
+                "compliant ✅"
+            } else {
+                "VIOLATED ❌ (possible certification attack)"
+            }
+        );
+    }
+    if !r.security_warnings.is_empty() {
+        println!("  Security warnings:");
+        for w in &r.security_warnings {
+            println!("    ⚠️  {}", w);
+        }
+    }
+    println!();
+
     // Certificates
     println!("  Certificates ({}):", r.certificates.len());
     for (i, c) in r.certificates.iter().enumerate() {
@@ -243,81 +467,108 @@ fn print_result(r: &ValidationResult, index: usize, total_sigs: usize) {
     println!();
 }
 
-fn verify_pdf(path: &str) {
-    println!("══════════════════════════════════════════════");
-    println!("  Verifying: {}", path);
-    println!("══════════════════════════════════════════════\n");
-
+fn verify_pdf(path: &str, json_output: bool) {
     let pdf_bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("Error: could not read file '{}': {}", path, e);
+            if json_output {
+                let err = serde_json::json!({
+                    "file": path,
+                    "error": format!("could not read file: {}", e),
+                });
+                println!("{}", serde_json::to_string_pretty(&err).unwrap());
+            } else {
+                eprintln!("Error: could not read file '{}': {}", path, e);
+            }
             process::exit(1);
         }
     };
 
-    println!("  File size: {} bytes\n", pdf_bytes.len());
-
     match SignatureValidator::validate(&pdf_bytes) {
         Ok(results) => {
-            println!("  Found {} signature(s)\n", results.len());
-            for (i, r) in results.iter().enumerate() {
-                print_result(r, i, results.len());
-            }
-
-            // Print overall summary
-            let all_valid = results.iter().all(|r| r.is_valid());
-            let all_cms_ok = results.iter().all(|r| r.cms_signature_valid);
-            let all_digest_ok = results.iter().all(|r| r.digest_match);
-            let all_trusted = results.iter().all(|r| r.certificate_chain_trusted);
-            let any_untrusted = results.iter().any(|r| !r.certificate_chain_trusted);
-
-            println!("══════════════════════════════════════════════");
-            println!("  SUMMARY");
-            println!("══════════════════════════════════════════════");
-            println!("  Total signatures:   {}", results.len());
-            println!(
-                "  All CMS valid:      {}",
-                if all_cms_ok { "yes ✅" } else { "NO ❌" }
-            );
-            println!(
-                "  All digests match:  {}",
-                if all_digest_ok { "yes ✅" } else { "NO ❌" }
-            );
-            println!(
-                "  All chains trusted: {}",
-                if all_trusted {
-                    "yes ✅"
-                } else {
-                    "NO ⚠️  (one or more signers not from a recognized CA)"
+            if json_output {
+                let report = JsonReport::from_results(path, pdf_bytes.len(), &results);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap()
+                );
+                if !report.all_valid {
+                    process::exit(1);
                 }
-            );
-            println!(
-                "  Overall:            {}",
-                if all_valid {
+            } else {
+                // Human-readable output
+                println!("══════════════════════════════════════════════");
+                println!("  Verifying: {}", path);
+                println!("══════════════════════════════════════════════\n");
+                println!("  File size: {} bytes\n", pdf_bytes.len());
+                println!("  Found {} signature(s)\n", results.len());
+
+                for (i, r) in results.iter().enumerate() {
+                    print_result(r, i, results.len());
+                }
+
+                // Print overall summary
+                let all_valid = results.iter().all(|r| r.is_valid());
+                let all_cms_ok = results.iter().all(|r| r.cms_signature_valid);
+                let all_digest_ok = results.iter().all(|r| r.digest_match);
+                let all_trusted = results.iter().all(|r| r.certificate_chain_trusted);
+                let any_untrusted = results.iter().any(|r| !r.certificate_chain_trusted);
+
+                println!("══════════════════════════════════════════════");
+                println!("  SUMMARY");
+                println!("══════════════════════════════════════════════");
+                println!("  Total signatures:   {}", results.len());
+                println!(
+                    "  All CMS valid:      {}",
+                    if all_cms_ok { "yes ✅" } else { "NO ❌" }
+                );
+                println!(
+                    "  All digests match:  {}",
+                    if all_digest_ok { "yes ✅" } else { "NO ❌" }
+                );
+                println!(
+                    "  All chains trusted: {}",
                     if all_trusted {
-                        "✅ ALL SIGNATURES VALID"
+                        "yes ✅"
                     } else {
-                        "✅ ALL SIGNATURES VALID (but signer identity not verified — see warnings)"
+                        "NO ⚠️  (one or more signers not from a recognized CA)"
                     }
-                } else {
-                    "❌ ONE OR MORE SIGNATURES INVALID"
+                );
+                println!(
+                    "  Overall:            {}",
+                    if all_valid {
+                        if all_trusted {
+                            "✅ ALL SIGNATURES VALID"
+                        } else {
+                            "✅ ALL SIGNATURES VALID (but signer identity not verified — see warnings)"
+                        }
+                    } else {
+                        "❌ ONE OR MORE SIGNATURES INVALID"
+                    }
+                );
+                if any_untrusted && all_valid {
+                    println!();
+                    println!("  ⚠️  Note: Signature integrity is intact, but one or more signing");
+                    println!("     certificates are not issued by a recognized Certificate Authority.");
+                    println!("     The signer's identity cannot be independently verified.");
                 }
-            );
-            if any_untrusted && all_valid {
                 println!();
-                println!("  ⚠️  Note: Signature integrity is intact, but one or more signing");
-                println!("     certificates are not issued by a recognized Certificate Authority.");
-                println!("     The signer's identity cannot be independently verified.");
-            }
-            println!();
 
-            if !all_valid {
-                process::exit(1);
+                if !all_valid {
+                    process::exit(1);
+                }
             }
         }
         Err(e) => {
-            eprintln!("  Verification failed: {}\n", e);
+            if json_output {
+                let err = serde_json::json!({
+                    "file": path,
+                    "error": format!("{}", e),
+                });
+                println!("{}", serde_json::to_string_pretty(&err).unwrap());
+            } else {
+                eprintln!("  Verification failed: {}\n", e);
+            }
             process::exit(1);
         }
     }
@@ -326,14 +577,39 @@ fn verify_pdf(path: &str) {
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 2 {
-        // Default: verify examples/result.pdf
-        println!("Usage: verify_pdf <file.pdf> [file2.pdf ...]\n");
-        println!("No file specified, verifying default: examples/result.pdf\n");
-        verify_pdf("./examples/result.pdf");
+    let json_output = args.iter().any(|a| a == "--json" || a == "-j");
+    let files: Vec<&String> = args[1..]
+        .iter()
+        .filter(|a| *a != "--json" && *a != "-j" && *a != "--help" && *a != "-h")
+        .collect();
+    let show_help = args.iter().any(|a| a == "--help" || a == "-h");
+
+    if show_help {
+        eprintln!(
+            "Usage: verify_pdf [options] <file.pdf> [file2.pdf ...]
+
+Options:
+  --json, -j    Output results in JSON format
+  --help, -h    Show this help
+
+Examples:
+  verify_pdf signed.pdf
+  verify_pdf signed.pdf --json
+  verify_pdf signed.pdf --json > report.json
+  verify_pdf doc1.pdf doc2.pdf"
+        );
+        return;
+    }
+
+    if files.is_empty() {
+        if !json_output {
+            println!("Usage: verify_pdf [--json] <file.pdf> [file2.pdf ...]\n");
+            println!("No file specified, verifying default: examples/result.pdf\n");
+        }
+        verify_pdf("./examples/result.pdf", json_output);
     } else {
-        for path in &args[1..] {
-            verify_pdf(path);
+        for path in &files {
+            verify_pdf(path, json_output);
         }
     }
 }
