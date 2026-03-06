@@ -99,6 +99,18 @@ pub struct ValidationResult {
     /// revocation data, plus a timestamp.
     pub is_ltv_enabled: bool,
 
+    // ── modification detection ─────────────────────────────
+    /// The byte offset where this signature's revision ends (the `%%EOF`
+    /// that terminates the incremental update containing this signature).
+    pub signature_revision_end: usize,
+    /// `true` when subsequent incremental updates contain ONLY permitted
+    /// changes (new signatures, DSS, annotations for new sigs).
+    /// `false` when unauthorized modifications were detected after signing.
+    pub no_unauthorized_modifications: bool,
+    /// Human-readable list of modifications detected after this signature.
+    /// Empty means no modifications (or this is the last revision).
+    pub modification_notes: Vec<String>,
+
     // ── aggregate ──────────────────────────────────────────
     /// Human‑readable problems found during validation (empty = all good).
     pub errors: Vec<String>,
@@ -110,6 +122,7 @@ impl ValidationResult {
         self.digest_match
             && self.cms_signature_valid
             && self.certificate_chain_valid
+            && self.no_unauthorized_modifications
             && self.errors.is_empty()
     }
 }
@@ -152,6 +165,29 @@ impl SignatureValidator {
             let result = Self::validate_one(pdf_bytes, &doc, field_info)?;
             results.push(result);
         }
+
+        // ── Determine revision boundaries for each signature ──
+        // Find all %%EOF markers — each marks the end of a revision.
+        let eof_offsets = Self::find_eof_offsets(pdf_bytes);
+
+        // For each signature, find which revision it belongs to by looking
+        // at where its ByteRange ends, then find the next %%EOF after that.
+        for r in results.iter_mut() {
+            if r.byte_range.len() == 4 {
+                let sig_data_end = (r.byte_range[2] + r.byte_range[3]) as usize;
+                // Find the %%EOF that terminates this signature's revision
+                r.signature_revision_end = eof_offsets
+                    .iter()
+                    .find(|&&eof| eof >= sig_data_end)
+                    .copied()
+                    .unwrap_or(pdf_bytes.len());
+            }
+        }
+
+        // ── Modification detection ──
+        // For each non-last signature, check that incremental updates
+        // added AFTER its revision contain only permitted changes.
+        Self::detect_modifications(pdf_bytes, &mut results)?;
 
         // In a multi-signature document, only the *last* signature (the most
         // recent incremental update) is expected to cover the entire file.
@@ -565,6 +601,9 @@ impl SignatureValidator {
             has_cms_revocation_data,
             has_timestamp,
             is_ltv_enabled,
+            signature_revision_end: 0,
+            no_unauthorized_modifications: true,
+            modification_notes: Vec::new(),
             errors,
         })
     }
@@ -934,6 +973,649 @@ impl SignatureValidator {
         }
         true
     }
+
+    // ── Modification detection (like Adobe Reader) ─────────
+
+    /// Find all `%%EOF` markers in the raw PDF bytes.
+    /// Each marks the end of a revision (original or incremental update).
+    /// Returns the byte offset of the character AFTER the last byte of
+    /// each `%%EOF\n` (or `%%EOF\r\n`).
+    fn find_eof_offsets(pdf_bytes: &[u8]) -> Vec<usize> {
+        let marker = b"%%EOF";
+        let mut offsets = Vec::new();
+        let mut pos = 0;
+        while pos + marker.len() <= pdf_bytes.len() {
+            if let Some(found) = pdf_bytes[pos..]
+                .windows(marker.len())
+                .position(|w| w == marker)
+            {
+                let abs = pos + found;
+                // The revision ends after %%EOF + any trailing newline
+                let mut end = abs + marker.len();
+                // Skip \r\n or \n after %%EOF
+                if end < pdf_bytes.len() && pdf_bytes[end] == b'\r' {
+                    end += 1;
+                }
+                if end < pdf_bytes.len() && pdf_bytes[end] == b'\n' {
+                    end += 1;
+                }
+                offsets.push(end);
+                pos = end;
+            } else {
+                break;
+            }
+        }
+        offsets
+    }
+
+    /// For each signature, check whether subsequent revisions contain
+    /// only permitted modifications.
+    ///
+    /// **Permitted changes** (following Adobe/PAdES conventions):
+    /// - Adding new signature fields + widget annotations
+    /// - Updating AcroForm to add new fields and set SigFlags
+    /// - Updating page Annots to add new annotations
+    /// - Adding/updating DSS (Document Security Store) and VRI
+    /// - Adding a DocTimeStamp
+    /// - Updating the Catalog to add DSS
+    /// - Adding new objects that are signature values, streams (CRL/OCSP/Cert)
+    ///
+    /// **Unauthorized changes**:
+    /// - Modifying page content streams
+    /// - Changing form field values (other than signature fields)
+    /// - Modifying fonts, images, or other resources
+    /// - Deleting objects
+    /// - Changing metadata in ways that alter document meaning
+    fn detect_modifications(
+        pdf_bytes: &[u8],
+        results: &mut [ValidationResult],
+    ) -> Result<(), Error> {
+        let total = results.len();
+        if total == 0 {
+            return Ok(());
+        }
+
+        // Determine which signatures need modification checking.
+        // - All non-last signatures: always check (subsequent sigs were appended)
+        // - Last signature: only check if it does NOT cover the whole file
+        //   (i.e. something was appended after it)
+        let last_idx = total - 1;
+        if results[last_idx].byte_range_covers_whole_file {
+            results[last_idx].no_unauthorized_modifications = true;
+        }
+        // If the last sig doesn't cover the whole file, it will be checked
+        // in the loop below.
+
+        // For each signature that has subsequent data, check what was added.
+        for sig_idx in 0..total {
+            // Skip the last signature if it covers the whole file
+            if sig_idx == last_idx && results[last_idx].byte_range_covers_whole_file {
+                continue;
+            }
+
+            let rev_end = results[sig_idx].signature_revision_end;
+            if rev_end == 0 || rev_end >= pdf_bytes.len() {
+                // Cannot determine revision boundary
+                results[sig_idx].no_unauthorized_modifications = true;
+                continue;
+            }
+
+            // Parse the PDF up to this signature's revision end to get
+            // the "original" state of objects.
+            let revision_bytes = &pdf_bytes[..rev_end];
+            let revision_doc = match Document::load_mem(revision_bytes) {
+                Ok(d) => d,
+                Err(_) => {
+                    // If we can't parse the revision, we can't check
+                    results[sig_idx].no_unauthorized_modifications = true;
+                    results[sig_idx].modification_notes.push(
+                        "Could not parse signature revision for modification check".into(),
+                    );
+                    continue;
+                }
+            };
+
+            // Parse the full document to see what changed
+            let full_doc = match Document::load_mem(pdf_bytes) {
+                Ok(d) => d,
+                Err(_) => {
+                    results[sig_idx].no_unauthorized_modifications = true;
+                    continue;
+                }
+            };
+
+            // Collect all object IDs and their types from both documents
+            let (unauthorized, notes) =
+                Self::compare_revisions(&revision_doc, &full_doc, pdf_bytes, rev_end);
+
+            results[sig_idx].no_unauthorized_modifications = !unauthorized;
+            results[sig_idx].modification_notes = notes;
+
+            if unauthorized {
+                results[sig_idx].errors.push(
+                    "Document has been modified after this signature was applied".into(),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Compare two document states (at-signature vs final) and classify
+    /// the changes.  Returns `(has_unauthorized, notes)`.
+    fn compare_revisions(
+        revision_doc: &Document,
+        full_doc: &Document,
+        _pdf_bytes: &[u8],
+        _rev_end: usize,
+    ) -> (bool, Vec<String>) {
+        let mut notes = Vec::new();
+        let mut has_unauthorized = false;
+
+        // Collect object IDs from each document
+        let rev_objects: std::collections::HashSet<(u32, u16)> =
+            revision_doc.objects.keys().cloned().collect();
+        let full_objects: std::collections::HashSet<(u32, u16)> =
+            full_doc.objects.keys().cloned().collect();
+
+        // -- New objects (added after the signature) --
+        let new_objects: Vec<(u32, u16)> = full_objects
+            .difference(&rev_objects)
+            .cloned()
+            .collect();
+
+        for &obj_id in &new_objects {
+            let classification = Self::classify_new_object(full_doc, obj_id);
+            match classification {
+                ObjectChange::Permitted(desc) => {
+                    notes.push(format!("Added {}: {} (permitted)", obj_id.0, desc));
+                }
+                ObjectChange::Unauthorized(desc) => {
+                    notes.push(format!(
+                        "Added {}: {} (UNAUTHORIZED)",
+                        obj_id.0, desc
+                    ));
+                    has_unauthorized = true;
+                }
+            }
+        }
+
+        // -- Modified objects (exist in both but changed) --
+        let common_objects: Vec<(u32, u16)> = rev_objects
+            .intersection(&full_objects)
+            .cloned()
+            .collect();
+
+        for &obj_id in &common_objects {
+            let rev_obj = match revision_doc.get_object(obj_id) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            let full_obj = match full_doc.get_object(obj_id) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+
+            // Quick check: if objects serialize to the same bytes, no change
+            let rev_str = format!("{:?}", rev_obj);
+            let full_str = format!("{:?}", full_obj);
+            if rev_str == full_str {
+                continue;
+            }
+
+            // Object was modified — classify the change
+            let classification = Self::classify_modified_object(
+                revision_doc, full_doc, obj_id, rev_obj, full_obj,
+            );
+            match classification {
+                ObjectChange::Permitted(desc) => {
+                    notes.push(format!(
+                        "Modified {}: {} (permitted)",
+                        obj_id.0, desc
+                    ));
+                }
+                ObjectChange::Unauthorized(desc) => {
+                    notes.push(format!(
+                        "Modified {}: {} (UNAUTHORIZED)",
+                        obj_id.0, desc
+                    ));
+                    has_unauthorized = true;
+                }
+            }
+        }
+
+        // -- Deleted objects --
+        let deleted_objects: Vec<(u32, u16)> = rev_objects
+            .difference(&full_objects)
+            .cloned()
+            .collect();
+
+        for &obj_id in &deleted_objects {
+            notes.push(format!(
+                "Deleted object {} (UNAUTHORIZED)",
+                obj_id.0
+            ));
+            has_unauthorized = true;
+        }
+
+        (has_unauthorized, notes)
+    }
+
+    /// Classify a newly added object.
+    fn classify_new_object(doc: &Document, obj_id: (u32, u16)) -> ObjectChange {
+        let obj = match doc.get_object(obj_id) {
+            Ok(o) => o,
+            Err(_) => return ObjectChange::Unauthorized("unreadable object".into()),
+        };
+
+        match obj {
+            Object::Dictionary(dict) => {
+                // Signature value dictionary (/Type /Sig or /Type /DocTimeStamp)
+                if let Ok(type_name) = dict.get(b"Type").and_then(|o| o.as_name_str()) {
+                    match type_name {
+                        "Sig" | "DocTimeStamp" => {
+                            return ObjectChange::Permitted("signature value dictionary".into());
+                        }
+                        "Annot" => {
+                            if let Ok(subtype) = dict.get(b"Subtype").and_then(|o| o.as_name_str()) {
+                                if subtype == "Widget" {
+                                    return ObjectChange::Permitted("widget annotation".into());
+                                }
+                            }
+                        }
+                        "Catalog" => {
+                            return ObjectChange::Permitted("catalog update".into());
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Signature field (/FT /Sig)
+                if let Ok(ft) = dict.get(b"FT").and_then(|o| o.as_name_str()) {
+                    if ft == "Sig" {
+                        return ObjectChange::Permitted("signature field".into());
+                    }
+                }
+
+                // Widget annotation without /Type key
+                if let Ok(subtype) = dict.get(b"Subtype").and_then(|o| o.as_name_str()) {
+                    if subtype == "Widget" {
+                        if dict.has(b"FT") || dict.has(b"V") {
+                            return ObjectChange::Permitted(
+                                "signature field/widget annotation".into(),
+                            );
+                        }
+                    }
+                }
+
+                // DSS dictionary
+                if dict.has(b"VRI") || dict.has(b"CRLs") || dict.has(b"OCSPs") || dict.has(b"Certs") {
+                    return ObjectChange::Permitted("DSS dictionary".into());
+                }
+
+                // VRI sub-dictionary
+                if dict.has(b"Cert") || dict.has(b"CRL") || dict.has(b"OCSP") {
+                    return ObjectChange::Permitted("VRI entry".into());
+                }
+
+                // AcroForm with only Fields + SigFlags
+                if dict.has(b"Fields") && dict.has(b"SigFlags") {
+                    let key_count = dict.len();
+                    if key_count <= 3 {
+                        // Fields, SigFlags, and maybe DR (default resources)
+                        return ObjectChange::Permitted("AcroForm update".into());
+                    }
+                }
+
+                // Check if it has /ByteRange and /Contents (signature-like)
+                if dict.has(b"ByteRange") && dict.has(b"Contents") {
+                    if dict.has(b"Filter") {
+                        return ObjectChange::Permitted("signature value dictionary".into());
+                    }
+                }
+
+                ObjectChange::Unauthorized(format!(
+                    "dictionary with keys: {:?}",
+                    dict.iter()
+                        .map(|(k, _)| String::from_utf8_lossy(k).to_string())
+                        .collect::<Vec<_>>()
+                ))
+            }
+            Object::Stream(stream) => {
+                // Streams for CRL, OCSP, or certificate data (used in DSS)
+                let dict = &stream.dict;
+                if let Ok(type_name) = dict.get(b"Type").and_then(|o| o.as_name_str()) {
+                    if type_name == "XObject" {
+                        // Could be a signature appearance — check Subtype
+                        if let Ok(subtype) = dict.get(b"Subtype").and_then(|o| o.as_name_str()) {
+                            if subtype == "Form" {
+                                return ObjectChange::Permitted(
+                                    "form XObject (signature appearance)".into(),
+                                );
+                            }
+                        }
+                    }
+                }
+                // DSS streams typically don't have /Type, just /Length
+                // Accept streams that are small-ish (likely CRL/OCSP/cert)
+                // or that appear alongside DSS-related objects
+                let keys: Vec<String> = dict
+                    .iter()
+                    .map(|(k, _)| String::from_utf8_lossy(k).to_string())
+                    .collect();
+                // If it has only Length (and maybe Filter/DecodeParms),
+                // it's likely a DSS data stream
+                let is_simple_stream = keys.iter().all(|k| {
+                    matches!(k.as_str(), "Length" | "Filter" | "DecodeParms" | "DL")
+                });
+                if is_simple_stream {
+                    return ObjectChange::Permitted("data stream (likely DSS/CRL/OCSP)".into());
+                }
+
+                ObjectChange::Unauthorized(format!(
+                    "stream with keys: {:?}",
+                    keys
+                ))
+            }
+            _ => ObjectChange::Unauthorized(format!("object: {:?}", obj)),
+        }
+    }
+
+    /// Classify a modification to an existing object.
+    fn classify_modified_object(
+        _rev_doc: &Document,
+        full_doc: &Document,
+        obj_id: (u32, u16),
+        rev_obj: &Object,
+        full_obj: &Object,
+    ) -> ObjectChange {
+        // Check if this is the Catalog (Root)
+        if let Ok(root_ref) = full_doc.trailer.get(b"Root").and_then(|o| o.as_reference()) {
+            if root_ref == obj_id {
+                return Self::classify_catalog_change(rev_obj, full_obj);
+            }
+        }
+
+        // Check if this is a Page dictionary
+        if let (Ok(rev_dict), Ok(full_dict)) = (rev_obj.as_dict(), full_obj.as_dict()) {
+            if let Ok(type_name) = full_dict.get(b"Type").and_then(|o| o.as_name_str()) {
+                if type_name == "Page" {
+                    return Self::classify_page_change(rev_dict, full_dict);
+                }
+            }
+
+            // AcroForm dictionary
+            if full_dict.has(b"Fields") && full_dict.has(b"SigFlags") {
+                return Self::classify_acroform_change(rev_dict, full_dict);
+            }
+        }
+
+        ObjectChange::Unauthorized(format!("object {} modified", obj_id.0))
+    }
+
+    /// Check if a Catalog modification is permitted.
+    /// Allowed: adding /DSS, updating /AcroForm reference.
+    fn classify_catalog_change(rev_obj: &Object, full_obj: &Object) -> ObjectChange {
+        let rev_dict = match rev_obj.as_dict() {
+            Ok(d) => d,
+            Err(_) => return ObjectChange::Unauthorized("catalog is not a dictionary".into()),
+        };
+        let full_dict = match full_obj.as_dict() {
+            Ok(d) => d,
+            Err(_) => return ObjectChange::Unauthorized("catalog is not a dictionary".into()),
+        };
+
+        let mut changes = Vec::new();
+        let mut unauthorized = false;
+
+        for (key, full_val) in full_dict.iter() {
+            let key_str = String::from_utf8_lossy(key).to_string();
+            match rev_dict.get(key) {
+                Ok(rev_val) => {
+                    let rv = format!("{:?}", rev_val);
+                    let fv = format!("{:?}", full_val);
+                    if rv != fv {
+                        match key_str.as_str() {
+                            "AcroForm" | "DSS" | "Perms" => {
+                                changes.push(format!("/{} updated", key_str));
+                            }
+                            _ => {
+                                changes.push(format!(
+                                    "/{} modified (unauthorized)",
+                                    key_str
+                                ));
+                                unauthorized = true;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    // New key added
+                    match key_str.as_str() {
+                        "DSS" | "Perms" | "AcroForm" => {
+                            changes.push(format!("/{} added", key_str));
+                        }
+                        _ => {
+                            changes.push(format!("/{} added (unauthorized)", key_str));
+                            unauthorized = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check for deleted keys
+        for (key, _) in rev_dict.iter() {
+            if full_dict.get(key).is_err() {
+                let key_str = String::from_utf8_lossy(key).to_string();
+                changes.push(format!("/{} removed (unauthorized)", key_str));
+                unauthorized = true;
+            }
+        }
+
+        let desc = if changes.is_empty() {
+            "catalog (no visible changes)".into()
+        } else {
+            format!("catalog: {}", changes.join(", "))
+        };
+
+        if unauthorized {
+            ObjectChange::Unauthorized(desc)
+        } else {
+            ObjectChange::Permitted(desc)
+        }
+    }
+
+    /// Check if a Page modification is permitted.
+    /// Allowed: updating /Annots to add new annotation references.
+    /// Not allowed: changing /Contents, /Resources, /MediaBox, etc.
+    fn classify_page_change(
+        rev_dict: &lopdf::Dictionary,
+        full_dict: &lopdf::Dictionary,
+    ) -> ObjectChange {
+        let mut changes = Vec::new();
+        let mut unauthorized = false;
+
+        for (key, full_val) in full_dict.iter() {
+            let key_str = String::from_utf8_lossy(key).to_string();
+            match rev_dict.get(key) {
+                Ok(rev_val) => {
+                    let rv = format!("{:?}", rev_val);
+                    let fv = format!("{:?}", full_val);
+                    if rv != fv {
+                        match key_str.as_str() {
+                            "Annots" => {
+                                // Annots can grow (add new annotations) but
+                                // existing entries must not be removed/changed.
+                                if Self::is_array_append_only(rev_val, full_val) {
+                                    changes.push("/Annots extended".into());
+                                } else {
+                                    changes.push(
+                                        "/Annots modified (not append-only)".into(),
+                                    );
+                                    unauthorized = true;
+                                }
+                            }
+                            "Resources" => {
+                                // Resources may be updated to add XObjects for
+                                // signature appearances
+                                changes.push("/Resources updated".into());
+                                // We allow this as it's commonly needed for
+                                // visible signature images
+                            }
+                            _ => {
+                                changes.push(format!(
+                                    "/{} modified (unauthorized)",
+                                    key_str
+                                ));
+                                unauthorized = true;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    match key_str.as_str() {
+                        "Annots" => {
+                            changes.push("/Annots added".into());
+                        }
+                        _ => {
+                            changes.push(format!("/{} added (unauthorized)", key_str));
+                            unauthorized = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check for removed keys
+        for (key, _) in rev_dict.iter() {
+            if full_dict.get(key).is_err() {
+                let key_str = String::from_utf8_lossy(key).to_string();
+                changes.push(format!("/{} removed (unauthorized)", key_str));
+                unauthorized = true;
+            }
+        }
+
+        let desc = if changes.is_empty() {
+            "page (no visible changes)".into()
+        } else {
+            format!("page: {}", changes.join(", "))
+        };
+
+        if unauthorized {
+            ObjectChange::Unauthorized(desc)
+        } else {
+            ObjectChange::Permitted(desc)
+        }
+    }
+
+    /// Check if an AcroForm modification is permitted.
+    /// Allowed: adding entries to /Fields, changing /SigFlags.
+    fn classify_acroform_change(
+        rev_dict: &lopdf::Dictionary,
+        full_dict: &lopdf::Dictionary,
+    ) -> ObjectChange {
+        let mut changes = Vec::new();
+        let mut unauthorized = false;
+
+        for (key, full_val) in full_dict.iter() {
+            let key_str = String::from_utf8_lossy(key).to_string();
+            match rev_dict.get(key) {
+                Ok(rev_val) => {
+                    let rv = format!("{:?}", rev_val);
+                    let fv = format!("{:?}", full_val);
+                    if rv != fv {
+                        match key_str.as_str() {
+                            "Fields" => {
+                                if Self::is_array_append_only(rev_val, full_val) {
+                                    changes.push("/Fields extended".into());
+                                } else {
+                                    changes.push(
+                                        "/Fields modified (not append-only)".into(),
+                                    );
+                                    unauthorized = true;
+                                }
+                            }
+                            "SigFlags" => {
+                                changes.push("/SigFlags updated".into());
+                            }
+                            "DR" => {
+                                // Default Resources — allowed for signature appearances
+                                changes.push("/DR updated".into());
+                            }
+                            _ => {
+                                changes.push(format!(
+                                    "/{} modified (unauthorized)",
+                                    key_str
+                                ));
+                                unauthorized = true;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    match key_str.as_str() {
+                        "Fields" | "SigFlags" | "DR" => {
+                            changes.push(format!("/{} added", key_str));
+                        }
+                        _ => {
+                            changes.push(format!("/{} added (unauthorized)", key_str));
+                            unauthorized = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let desc = if changes.is_empty() {
+            "AcroForm (no visible changes)".into()
+        } else {
+            format!("AcroForm: {}", changes.join(", "))
+        };
+
+        if unauthorized {
+            ObjectChange::Unauthorized(desc)
+        } else {
+            ObjectChange::Permitted(desc)
+        }
+    }
+
+    /// Check if a full array is a strict superset of the revision array
+    /// (append-only modification).
+    fn is_array_append_only(rev_val: &Object, full_val: &Object) -> bool {
+        let rev_arr = match rev_val.as_array() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let full_arr = match full_val.as_array() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+
+        // Full array must be at least as long as revision array
+        if full_arr.len() < rev_arr.len() {
+            return false;
+        }
+
+        // All original entries must be preserved in order
+        for (i, rev_item) in rev_arr.iter().enumerate() {
+            let rev_str = format!("{:?}", rev_item);
+            let full_str = format!("{:?}", full_arr[i]);
+            if rev_str != full_str {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+/// Classification of a change found between revisions.
+enum ObjectChange {
+    /// The change is permitted (e.g., adding a new signature field).
+    Permitted(String),
+    /// The change is unauthorized (e.g., modifying page content).
+    Unauthorized(String),
 }
 
 // ── ASN.1 time helpers ────────────────────────────────────────
@@ -1032,6 +1714,100 @@ mod tests {
 
         assert!(r.cms_signature_valid, "CMS signature should verify");
         assert!(r.digest_match, "Digest should match");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_modification_detection_on_signed_pdf() -> Result<(), Box<dyn std::error::Error>> {
+        // A legitimately signed PDF should show no unauthorized modifications
+        let pdf_bytes = fs::read("examples/assets/sample-signed.pdf")
+            .or_else(|_| fs::read("examples/result.pdf"))?;
+
+        let results = SignatureValidator::validate(&pdf_bytes)?;
+        assert!(!results.is_empty());
+
+        let r = &results[0];
+        eprintln!("=== Modification Detection ===");
+        eprintln!("  no_unauthorized_modifications: {}", r.no_unauthorized_modifications);
+        eprintln!("  modification_notes: {:?}", r.modification_notes);
+        eprintln!("  signature_revision_end: {}", r.signature_revision_end);
+
+        // A single-sig PDF that covers the whole file should have no modifications
+        if r.byte_range_covers_whole_file {
+            assert!(
+                r.no_unauthorized_modifications,
+                "Legitimately signed PDF should have no unauthorized modifications"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_modification_detection_tampered_pdf() -> Result<(), Box<dyn std::error::Error>> {
+        // Read a signed PDF
+        let signed_bytes = fs::read("examples/assets/sample-signed.pdf")
+            .or_else(|_| fs::read("examples/result.pdf"))?;
+
+        // Tamper with it: append a fake incremental update that replaces
+        // the content stream (object 4)
+        let mut tampered = signed_bytes.clone();
+        let obj4_offset = tampered.len();
+
+        // Write a new object 4 (content stream)
+        tampered.extend_from_slice(b"4 0 obj\n<</Length 44>>\nstream\n");
+        tampered.extend_from_slice(b"BT /F1 24 Tf 100 700 Td (TAMPERED!) Tj ET\n");
+        tampered.extend_from_slice(b"endstream\nendobj\n");
+
+        // Write xref
+        let xref_pos = tampered.len();
+        tampered.extend_from_slice(b"xref\n4 1\n");
+        tampered.extend_from_slice(format!("{:010} 00000 n \n", obj4_offset).as_bytes());
+        tampered.extend_from_slice(b"trailer\n");
+
+        // Find prev startxref
+        let prev_xref_start = signed_bytes
+            .windows(10)
+            .rposition(|w| w == b"startxref\n")
+            .unwrap()
+            + 10;
+        let prev_xref_end = signed_bytes[prev_xref_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap()
+            + prev_xref_start;
+        let prev_xref_val = std::str::from_utf8(
+            &signed_bytes[prev_xref_start..prev_xref_end],
+        )?.trim();
+
+        tampered.extend_from_slice(
+            format!(
+                "<</Root 13 0 R/Info 1 0 R/Prev {}/Size 30>>\n",
+                prev_xref_val
+            )
+            .as_bytes(),
+        );
+        tampered.extend_from_slice(format!("startxref\n{}\n%%EOF\n", xref_pos).as_bytes());
+
+        // Verify the tampered PDF detects unauthorized modifications
+        let results = SignatureValidator::validate(&tampered)?;
+        assert!(!results.is_empty());
+
+        let r = &results[0];
+        eprintln!("=== Tampered PDF ===");
+        eprintln!("  no_unauthorized_modifications: {}", r.no_unauthorized_modifications);
+        eprintln!("  modification_notes: {:?}", r.modification_notes);
+        eprintln!("  errors: {:?}", r.errors);
+
+        assert!(
+            !r.no_unauthorized_modifications,
+            "Tampered PDF should detect unauthorized modifications"
+        );
+        assert!(
+            r.errors.iter().any(|e| e.contains("modified after")),
+            "Should have an error about post-signing modification"
+        );
 
         Ok(())
     }

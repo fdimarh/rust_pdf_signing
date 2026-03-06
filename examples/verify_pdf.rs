@@ -170,6 +170,31 @@ fn print_result(r: &ValidationResult, index: usize, total_sigs: usize) {
     }
     println!();
 
+    // Modification detection
+    println!(
+        "  Modification check: {}",
+        if r.no_unauthorized_modifications {
+            "no unauthorized changes ✅"
+        } else {
+            "UNAUTHORIZED MODIFICATIONS DETECTED ❌"
+        }
+    );
+    if !r.modification_notes.is_empty() {
+        println!("  Changes after this signature:");
+        for note in &r.modification_notes {
+            let icon = if note.contains("UNAUTHORIZED") {
+                "❌"
+            } else {
+                "✅"
+            };
+            println!("    {} {}", icon, note);
+        }
+    }
+    if r.byte_range_covers_whole_file {
+        println!("  (last signature — no subsequent revisions)");
+    }
+    println!();
+
     // Certificates
     println!("  Certificates ({}):", r.certificates.len());
     for (i, c) in r.certificates.iter().enumerate() {
