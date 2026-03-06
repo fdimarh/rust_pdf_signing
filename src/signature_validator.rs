@@ -318,10 +318,17 @@ impl SignatureValidator {
         // recent incremental update) is expected to cover the entire file.
         // Earlier signatures legitimately have a ByteRange that ends before
         // subsequent incremental updates.
+        //
+        // For PAdES B-LT and B-LTA, the DSS dictionary is appended as an
+        // incremental update after the signature, so the last signature's
+        // ByteRange intentionally does NOT cover the whole file.  This is
+        // only an error if unauthorized modifications were also detected.
         let total = results.len();
         if total > 0 {
             let last_idx = total - 1;
-            if !results[last_idx].byte_range_covers_whole_file {
+            if !results[last_idx].byte_range_covers_whole_file
+                && !results[last_idx].no_unauthorized_modifications
+            {
                 results[last_idx].errors.push(
                     "ByteRange does not cover the entire file".into(),
                 );
@@ -1115,6 +1122,66 @@ impl SignatureValidator {
     /// - `chain_trusted`: the root CA is a known trusted certificate
     ///   authority (not self-signed with an unknown issuer).
     /// - `warnings`: human-readable notes about trust issues.
+
+    /// Sort certificates into chain order: End-Entity → Intermediate(s) → Root.
+    ///
+    /// CMS SignedData certificates may be in any order.  This method finds
+    /// the end-entity cert (the one whose subject is NOT the issuer of any
+    /// other cert) and builds the chain by following issuer links.
+    fn order_certificate_chain(certs: &[CertificateInfo]) -> Vec<CertificateInfo> {
+        if certs.len() <= 1 {
+            return certs.to_vec();
+        }
+
+        // Build a set of all subjects that are issuers of other certs
+        let issuer_subjects: std::collections::HashSet<&str> = certs
+            .iter()
+            .filter(|c| c.subject != c.issuer) // exclude self-signed
+            .map(|c| c.issuer.as_str())
+            .collect();
+
+        // Find the end-entity: a cert whose subject is NOT the issuer of
+        // any other cert (and is not self-signed)
+        let ee = certs
+            .iter()
+            .find(|c| !c.is_self_signed && !issuer_subjects.contains(c.subject.as_str()))
+            .or_else(|| {
+                // Fallback: pick first non-self-signed cert
+                certs.iter().find(|c| !c.is_self_signed)
+            });
+
+        let ee = match ee {
+            Some(e) => e,
+            None => return certs.to_vec(), // all self-signed? just return as-is
+        };
+
+        // Build chain: start from EE, follow issuer links
+        let mut chain = vec![ee.clone()];
+        let mut current_issuer = &ee.issuer;
+        let mut used: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        used.insert(certs.iter().position(|c| std::ptr::eq(c, ee)).unwrap_or(0));
+
+        for _ in 0..certs.len() {
+            // Find the cert whose subject matches current_issuer
+            if let Some((idx, next)) = certs
+                .iter()
+                .enumerate()
+                .find(|(idx, c)| !used.contains(idx) && c.subject == *current_issuer)
+            {
+                chain.push(next.clone());
+                used.insert(idx);
+                if next.is_self_signed {
+                    break; // reached root
+                }
+                current_issuer = &next.issuer;
+            } else {
+                break; // no more matches
+            }
+        }
+
+        chain
+    }
+
     fn check_certificate_chain(
         certs: &[CertificateInfo],
         _now: &DateTime<Utc>,
@@ -1125,22 +1192,33 @@ impl SignatureValidator {
             return (false, false, vec!["No certificates in signature".into()]);
         }
 
+        // -- Sort certificates into chain order: EE → Intermediate(s) → Root --
+        // CMS certificates may be in arbitrary order.  Build a proper chain
+        // by finding the end-entity cert and following issuer links.
+        let ordered = Self::order_certificate_chain(certs);
+        let chain_certs = if ordered.len() == certs.len() {
+            ordered
+        } else {
+            // Fallback: use original order if we can't build a full chain
+            certs.to_vec()
+        };
+
         // -- Structural consistency: issuer chain linkage --
         let mut chain_valid = true;
-        if certs.len() > 1 {
-            for i in 0..certs.len() - 1 {
-                if certs[i].issuer != certs[i + 1].subject {
+        if chain_certs.len() > 1 {
+            for i in 0..chain_certs.len() - 1 {
+                if chain_certs[i].issuer != chain_certs[i + 1].subject {
                     chain_valid = false;
                     warnings.push(format!(
                         "Chain break: cert[{}] issuer '{}' does not match cert[{}] subject '{}'",
-                        i, certs[i].issuer, i + 1, certs[i + 1].subject
+                        i, chain_certs[i].issuer, i + 1, chain_certs[i + 1].subject
                     ));
                 }
             }
         }
 
         // -- Expiry check --
-        for (i, c) in certs.iter().enumerate() {
+        for (i, c) in chain_certs.iter().enumerate() {
             if c.is_expired {
                 chain_valid = false;
                 warnings.push(format!(
@@ -1163,12 +1241,12 @@ impl SignatureValidator {
         //  2. If the root is self-signed but part of a longer chain,
         //     it may be a private CA root — still warn.
         //  3. Known public CAs are recognized by common issuer names.
-        let root = &certs[certs.len() - 1];
-        let signer = &certs[0];
+        let root = &chain_certs[chain_certs.len() - 1];
+        let signer = &chain_certs[0];
         let chain_trusted;
 
         if root.is_self_signed {
-            if certs.len() == 1 {
+            if chain_certs.len() == 1 {
                 // Single self-signed cert — test certificate
                 chain_trusted = false;
                 warnings.push(format!(
@@ -2769,9 +2847,9 @@ mod tests {
     #[test]
     fn test_security_checks_on_blta_pdf() {
         let pdf_bytes = match fs::read("examples/result_pades_blta.pdf") {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("B-LTA PDF not found, skipping");
+            Ok(b) if b.len() > 10 => b,
+            _ => {
+                eprintln!("B-LTA PDF not found or empty, skipping");
                 return;
             }
         };

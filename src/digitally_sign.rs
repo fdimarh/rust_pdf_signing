@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::ltv::{append_dss_dictionary, build_adbe_revocation_attribute};
+use crate::ltv::{append_dss_dictionary, build_adbe_revocation_attribute, build_adbe_revocation_unsigned_der, inject_unsigned_attribute_into_cms};
 use crate::signature_options::{PadesLevel, SignatureFormat, SignatureOptions};
 use crate::{ByteRange, PDFSigningDocument, UserSignatureInfo};
 use bcder::Mode::Der;
@@ -134,9 +134,10 @@ impl PDFSigningDocument {
                 }
             }
         } else {
-            // PKCS7: use existing options directly
-            include_cms_revocation = signature_options.signed_attribute_include_crl
-                || signature_options.signed_attribute_include_ocsp;
+            // PKCS7: For Adobe/Foxit LTV, revocation data must be in CMS
+            // **unsigned attributes**, not signed attributes.  We skip it
+            // here and inject after signing via inject_unsigned_attribute_into_cms().
+            include_cms_revocation = false;
             include_timestamp = signature_options.timestamp_url.is_some();
             include_dss = signature_options.include_dss;
         }
@@ -190,7 +191,23 @@ impl PDFSigningDocument {
             builder = builder.certificate(user_certificate_chain[i].clone());
         }
 
-        let signature = builder.build_der().unwrap();
+        let mut signature = builder.build_der().unwrap();
+
+        // For PKCS7: inject adbe-revocationInfoArchival into CMS unsigned
+        // attributes (alongside the timestamp token).  Adobe/Foxit require
+        // revocation data in unsigned attrs for LTV recognition.
+        if !is_pades
+            && (signature_options.signed_attribute_include_crl
+                || signature_options.signed_attribute_include_ocsp)
+        {
+            if let Some(attr_der) = build_adbe_revocation_unsigned_der(
+                &user_certificate_chain,
+                signature_options.signed_attribute_include_crl,
+                signature_options.signed_attribute_include_ocsp,
+            ) {
+                signature = inject_unsigned_attribute_into_cms(&signature, &attr_der)?;
+            }
+        }
 
         #[cfg(feature = "debug")]
         {

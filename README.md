@@ -388,6 +388,8 @@ examples/
 
 See [`Create_Cert.md`](Create_Cert.md) for instructions on creating self-signed certificates for testing.
 
+Alternatively, use the **DSS PKI Factory** to generate test certificates with a full CA chain, CRL/OCSP endpoints, and LTV support — see [`DSS_PKI_Factory.md`](DSS_PKI_Factory.md).
+
 Quick command:
 
 ```bash

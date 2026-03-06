@@ -149,6 +149,19 @@ impl Values for CrlReponse {
     }
 }
 
+/// Helper to emit pre-encoded DER bytes as-is (no extra wrapping).
+struct RawDerBytes(Vec<u8>);
+
+impl Values for RawDerBytes {
+    fn encoded_len(&self, _: Mode) -> usize {
+        self.0.len()
+    }
+
+    fn write_encoded<W: Write>(&self, _: Mode, target: &mut W) -> Result<(), std::io::Error> {
+        target.write_all(&self.0)
+    }
+}
+
 pub(crate) fn encode_revocation_info_archival<'a>(
     crls_bytes: Vec<Vec<u8>>,
     ocsps_bytes: Vec<Vec<u8>>,
@@ -258,6 +271,304 @@ pub(crate) fn build_adbe_revocation_attribute(
     }
 
     return None;
+}
+
+/// Build the `adbe-revocationInfoArchival` attribute as a complete DER-encoded
+/// ASN.1 `Attribute` suitable for injection into CMS `unsignedAttrs`.
+///
+/// Returns `None` if no revocation data could be fetched.
+///
+/// The structure is:
+/// ```asn1
+/// Attribute ::= SEQUENCE {
+///   attrType   OBJECT IDENTIFIER,   -- 1.2.840.113583.1.1.8
+///   attrValues SET OF AttributeValue
+/// }
+/// ```
+pub(crate) fn build_adbe_revocation_unsigned_der(
+    user_certificate_chain: &Vec<CapturedX509Certificate>,
+    include_crl: bool,
+    include_ocsp: bool,
+) -> Option<Vec<u8>> {
+    let (crl_data, ocsp_data) =
+        fetch_revocation_data(user_certificate_chain, include_crl, include_ocsp);
+
+    let encoded_revocation_info = encode_revocation_info_archival(crl_data, ocsp_data)?;
+
+    // OID 1.2.840.113583.1.1.8 = adbe-revocationInfoArchival
+    let adbe_revocation_oid = Oid(Bytes::copy_from_slice(&[
+        42, 134, 72, 134, 247, 47, 1, 1, 8,
+    ]));
+
+    // The Captured contains the raw DER of RevocationInfoArchival SEQUENCE.
+    // We must embed the raw bytes directly into the SET, NOT use .encode()
+    // which would wrap them in an OCTET STRING.
+    let rev_info_bytes = encoded_revocation_info.as_slice();
+    let rev_info_raw = RawDerBytes(rev_info_bytes.to_vec());
+
+    // Attribute ::= SEQUENCE { attrType OID, attrValues SET OF ANY }
+    let attr = bcder::encode::sequence((
+        adbe_revocation_oid.encode(),
+        bcder::encode::set(rev_info_raw),
+    ));
+
+    Some(attr.to_captured(Der).as_slice().to_vec())
+}
+
+/// Inject an unsigned attribute into an already-signed CMS `SignedData` DER blob.
+///
+/// Adobe/Foxit require `adbe-revocationInfoArchival` to be in the CMS
+/// **unsigned attributes** (not signed attributes) for LTV recognition
+/// with `adbe.pkcs7.detached`.
+///
+/// This function:
+/// 1. Locates the `SignerInfo` inside the CMS `SignedData`.
+/// 2. Appends the given attribute DER to the existing `unsignedAttrs`
+///    (or creates the `[1] IMPLICIT SET OF` wrapper if absent).
+/// 3. Re-encodes the outer lengths so the CMS blob remains valid DER.
+///
+/// The CMS structure (simplified):
+/// ```text
+/// ContentInfo ::= SEQUENCE {
+///   contentType OID,
+///   content [0] EXPLICIT SignedData
+/// }
+/// SignedData ::= SEQUENCE {
+///   version, digestAlgorithms, encapContentInfo, [0] certificates,
+///   signerInfos SET OF SignerInfo
+/// }
+/// SignerInfo ::= SEQUENCE {
+///   version, sid, digestAlgorithm, [0] signedAttrs,
+///   signatureAlgorithm, signature,
+///   [1] unsignedAttrs OPTIONAL
+/// }
+/// ```
+pub(crate) fn inject_unsigned_attribute_into_cms(
+    cms_der: &[u8],
+    attr_der: &[u8],
+) -> Result<Vec<u8>, Error> {
+    // Strategy: We parse just enough of the DER structure to find the
+    // SignerInfo's unsignedAttrs location, then splice in the new attribute.
+    //
+    // Rather than a full ASN.1 rewrite (fragile), we find the end of the
+    // SignerInfo SEQUENCE and either:
+    //   a) If unsignedAttrs [1] already exists (timestamp was added), append
+    //      our attribute to it.
+    //   b) If unsignedAttrs is absent, add `[1] IMPLICIT SET OF { attr }`.
+
+    // Helper: read a DER tag+length, returning (tag_byte, header_len, content_len)
+    fn read_tl(data: &[u8], pos: usize) -> Option<(u8, usize, usize)> {
+        if pos >= data.len() {
+            return None;
+        }
+        let tag = data[pos];
+        if pos + 1 >= data.len() {
+            return None;
+        }
+        let len_byte = data[pos + 1];
+        if len_byte < 0x80 {
+            Some((tag, 2, len_byte as usize))
+        } else {
+            let num_bytes = (len_byte & 0x7f) as usize;
+            if num_bytes == 0 || num_bytes > 4 || pos + 2 + num_bytes > data.len() {
+                return None;
+            }
+            let mut length: usize = 0;
+            for i in 0..num_bytes {
+                length = (length << 8) | data[pos + 2 + i] as usize;
+            }
+            Some((tag, 2 + num_bytes, length))
+        }
+    }
+
+    // Helper: skip a TLV element, returning the position after it
+    fn skip_tlv(data: &[u8], pos: usize) -> Option<usize> {
+        let (_, hdr, len) = read_tl(data, pos)?;
+        Some(pos + hdr + len)
+    }
+
+    // Helper: encode a DER length
+    fn encode_length(len: usize) -> Vec<u8> {
+        if len < 0x80 {
+            vec![len as u8]
+        } else if len <= 0xff {
+            vec![0x81, len as u8]
+        } else if len <= 0xffff {
+            vec![0x82, (len >> 8) as u8, (len & 0xff) as u8]
+        } else if len <= 0xff_ffff {
+            vec![0x83, (len >> 16) as u8, ((len >> 8) & 0xff) as u8, (len & 0xff) as u8]
+        } else {
+            vec![
+                0x84,
+                (len >> 24) as u8,
+                ((len >> 16) & 0xff) as u8,
+                ((len >> 8) & 0xff) as u8,
+                (len & 0xff) as u8,
+            ]
+        }
+    }
+
+    // ── Parse the CMS structure to find insertion point ──
+
+    // ContentInfo SEQUENCE
+    let (_, ci_hdr, _ci_len) = read_tl(cms_der, 0)
+        .ok_or_else(|| Error::Other("Invalid CMS: cannot read ContentInfo".into()))?;
+
+    // contentType OID
+    let oid_end = skip_tlv(cms_der, ci_hdr)
+        .ok_or_else(|| Error::Other("Invalid CMS: cannot skip contentType OID".into()))?;
+
+    // content [0] EXPLICIT
+    let (_, ctx0_hdr, _ctx0_len) = read_tl(cms_der, oid_end)
+        .ok_or_else(|| Error::Other("Invalid CMS: cannot read [0] EXPLICIT".into()))?;
+    let signed_data_start = oid_end + ctx0_hdr;
+
+    // SignedData SEQUENCE
+    let (_, sd_hdr, _sd_len) = read_tl(cms_der, signed_data_start)
+        .ok_or_else(|| Error::Other("Invalid CMS: cannot read SignedData SEQUENCE".into()))?;
+    let mut pos = signed_data_start + sd_hdr;
+
+    // version INTEGER
+    pos = skip_tlv(cms_der, pos)
+        .ok_or_else(|| Error::Other("Invalid CMS: cannot skip version".into()))?;
+    // digestAlgorithms SET
+    pos = skip_tlv(cms_der, pos)
+        .ok_or_else(|| Error::Other("Invalid CMS: cannot skip digestAlgorithms".into()))?;
+    // encapContentInfo SEQUENCE
+    pos = skip_tlv(cms_der, pos)
+        .ok_or_else(|| Error::Other("Invalid CMS: cannot skip encapContentInfo".into()))?;
+
+    // [0] certificates (OPTIONAL, IMPLICIT)
+    if pos < cms_der.len() && (cms_der[pos] & 0xe0) == 0xa0 && (cms_der[pos] & 0x1f) == 0 {
+        pos = skip_tlv(cms_der, pos)
+            .ok_or_else(|| Error::Other("Invalid CMS: cannot skip certificates".into()))?;
+    }
+
+    // [1] crls (OPTIONAL, IMPLICIT) — rare but possible
+    if pos < cms_der.len() && cms_der[pos] == 0xa1 {
+        pos = skip_tlv(cms_der, pos)
+            .ok_or_else(|| Error::Other("Invalid CMS: cannot skip crls".into()))?;
+    }
+
+    // signerInfos SET OF
+    let (_, si_set_hdr, _si_set_len) = read_tl(cms_der, pos)
+        .ok_or_else(|| Error::Other("Invalid CMS: cannot read signerInfos SET".into()))?;
+    let si_start = pos + si_set_hdr;
+
+    // First (and usually only) SignerInfo SEQUENCE
+    let (_, si_hdr, si_len) = read_tl(cms_der, si_start)
+        .ok_or_else(|| Error::Other("Invalid CMS: cannot read SignerInfo SEQUENCE".into()))?;
+    let si_content_start = si_start + si_hdr;
+    let si_content_end = si_content_start + si_len;
+
+    // Walk through SignerInfo fields to find unsignedAttrs
+    let mut si_pos = si_content_start;
+
+    // version INTEGER
+    si_pos = skip_tlv(cms_der, si_pos)
+        .ok_or_else(|| Error::Other("Invalid SignerInfo: cannot skip version".into()))?;
+    // sid (IssuerAndSerialNumber SEQUENCE or [0] SubjectKeyIdentifier)
+    si_pos = skip_tlv(cms_der, si_pos)
+        .ok_or_else(|| Error::Other("Invalid SignerInfo: cannot skip sid".into()))?;
+    // digestAlgorithm AlgorithmIdentifier
+    si_pos = skip_tlv(cms_der, si_pos)
+        .ok_or_else(|| Error::Other("Invalid SignerInfo: cannot skip digestAlgorithm".into()))?;
+    // [0] signedAttrs (OPTIONAL)
+    if si_pos < si_content_end && cms_der[si_pos] == 0xa0 {
+        si_pos = skip_tlv(cms_der, si_pos)
+            .ok_or_else(|| Error::Other("Invalid SignerInfo: cannot skip signedAttrs".into()))?;
+    }
+    // signatureAlgorithm AlgorithmIdentifier
+    si_pos = skip_tlv(cms_der, si_pos)
+        .ok_or_else(|| Error::Other("Invalid SignerInfo: cannot skip signatureAlgorithm".into()))?;
+    // signature OCTET STRING
+    si_pos = skip_tlv(cms_der, si_pos)
+        .ok_or_else(|| Error::Other("Invalid SignerInfo: cannot skip signature".into()))?;
+
+    // Now si_pos is either at unsignedAttrs [1] or at si_content_end
+    let has_unsigned_attrs = si_pos < si_content_end && cms_der[si_pos] == 0xa1;
+
+    // ── Build the new CMS with injected unsigned attribute ──
+
+    let new_unsigned_content: Vec<u8>;
+
+    if has_unsigned_attrs {
+        // Existing [1] unsignedAttrs — append our attribute
+        let (_, ua_hdr, ua_len) = read_tl(cms_der, si_pos)
+            .ok_or_else(|| Error::Other("Invalid CMS: cannot read unsignedAttrs".into()))?;
+        let ua_content_start = si_pos + ua_hdr;
+        let ua_content_end = ua_content_start + ua_len;
+
+        // New content = existing content + new attribute
+        let mut content = cms_der[ua_content_start..ua_content_end].to_vec();
+        content.extend_from_slice(attr_der);
+        new_unsigned_content = content;
+    } else {
+        // No unsignedAttrs yet — create new
+        new_unsigned_content = attr_der.to_vec();
+    }
+
+    // Encode the new [1] IMPLICIT SET OF unsignedAttrs
+    let new_ua_len_bytes = encode_length(new_unsigned_content.len());
+
+    // Rebuild from the inside out, updating all outer lengths.
+    // 1. Build new SignerInfo content: everything before unsignedAttrs + new unsignedAttrs
+    let si_before_ua = &cms_der[si_content_start..si_pos];
+    let new_ua_size = 1 + new_ua_len_bytes.len() + new_unsigned_content.len();
+    let mut new_si_content = Vec::with_capacity(si_before_ua.len() + new_ua_size);
+    new_si_content.extend_from_slice(si_before_ua);
+    new_si_content.push(0xa1); // [1] IMPLICIT
+    new_si_content.extend_from_slice(&new_ua_len_bytes);
+    new_si_content.extend_from_slice(&new_unsigned_content);
+
+    // 2. Wrap in SignerInfo SEQUENCE
+    let si_seq_len = encode_length(new_si_content.len());
+    let mut new_si = Vec::with_capacity(1 + si_seq_len.len() + new_si_content.len());
+    new_si.push(0x30); // SEQUENCE
+    new_si.extend_from_slice(&si_seq_len);
+    new_si.extend_from_slice(&new_si_content);
+
+    // 3. Wrap in signerInfos SET OF
+    let si_set_content_len = encode_length(new_si.len());
+    let mut new_si_set = Vec::with_capacity(1 + si_set_content_len.len() + new_si.len());
+    new_si_set.push(0x31); // SET OF
+    new_si_set.extend_from_slice(&si_set_content_len);
+    new_si_set.extend_from_slice(&new_si);
+
+    // 4. Build new SignedData content: everything before signerInfos + new signerInfos
+    let sd_before_si = &cms_der[signed_data_start + sd_hdr..pos];
+    let mut new_sd_content = Vec::with_capacity(sd_before_si.len() + new_si_set.len());
+    new_sd_content.extend_from_slice(sd_before_si);
+    new_sd_content.extend_from_slice(&new_si_set);
+
+    // 5. Wrap in SignedData SEQUENCE
+    let sd_seq_len = encode_length(new_sd_content.len());
+    let mut new_sd = Vec::with_capacity(1 + sd_seq_len.len() + new_sd_content.len());
+    new_sd.push(0x30); // SEQUENCE
+    new_sd.extend_from_slice(&sd_seq_len);
+    new_sd.extend_from_slice(&new_sd_content);
+
+    // 6. Wrap in [0] EXPLICIT context
+    let ctx0_len = encode_length(new_sd.len());
+    let mut new_ctx0 = Vec::with_capacity(1 + ctx0_len.len() + new_sd.len());
+    new_ctx0.push(0xa0); // [0] EXPLICIT
+    new_ctx0.extend_from_slice(&ctx0_len);
+    new_ctx0.extend_from_slice(&new_sd);
+
+    // 7. Build ContentInfo: OID + new [0]
+    let oid_bytes = &cms_der[ci_hdr..oid_end];
+    let mut new_ci_content = Vec::with_capacity(oid_bytes.len() + new_ctx0.len());
+    new_ci_content.extend_from_slice(oid_bytes);
+    new_ci_content.extend_from_slice(&new_ctx0);
+
+    // 8. Wrap in ContentInfo SEQUENCE
+    let ci_seq_len = encode_length(new_ci_content.len());
+    let mut result = Vec::with_capacity(1 + ci_seq_len.len() + new_ci_content.len());
+    result.push(0x30); // SEQUENCE
+    result.extend_from_slice(&ci_seq_len);
+    result.extend_from_slice(&new_ci_content);
+
+    Ok(result)
 }
 
 pub(crate) fn append_dss_dictionary(
