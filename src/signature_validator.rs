@@ -71,6 +71,28 @@ pub struct ValidationResult {
     /// signed by the next) and none have expired at the time of validation.
     pub certificate_chain_valid: bool,
 
+    // ── LTV (Long-Term Validation) ─────────────────────────
+    /// `true` when the PDF contains a document-level DSS dictionary.
+    pub has_dss: bool,
+    /// Number of CRL streams in the DSS dictionary.
+    pub dss_crl_count: usize,
+    /// Number of OCSP response streams in the DSS dictionary.
+    pub dss_ocsp_count: usize,
+    /// Number of certificate streams in the DSS dictionary.
+    pub dss_cert_count: usize,
+    /// `true` when the DSS contains a VRI entry for this specific signature.
+    pub has_vri: bool,
+    /// `true` when the CMS `SignedData` contains embedded revocation data
+    /// (adbe-revocationInfoArchival attribute with CRL or OCSP).
+    pub has_cms_revocation_data: bool,
+    /// `true` when the CMS contains a signature timestamp
+    /// (id-smime-aa-signatureTimeStampToken unsigned attribute).
+    pub has_timestamp: bool,
+    /// `true` when the signature has enough information for long-term
+    /// validation: either DSS with revocation data, or CMS-embedded
+    /// revocation data, plus a timestamp.
+    pub is_ltv_enabled: bool,
+
     // ── aggregate ──────────────────────────────────────────
     /// Human‑readable problems found during validation (empty = all good).
     pub errors: Vec<String>,
@@ -386,6 +408,30 @@ impl SignatureValidator {
             }
         }
 
+        // ── LTV (Long-Term Validation) checks ─────────────
+        let (has_dss, dss_crl_count, dss_ocsp_count, dss_cert_count, has_vri) =
+            Self::check_dss(doc, &contents_bytes);
+
+        let has_cms_revocation_data = if !contents_bytes.is_empty() && !contents_all_zero {
+            Self::check_cms_revocation_data(&contents_bytes)
+        } else {
+            false
+        };
+
+        let has_timestamp = if !contents_bytes.is_empty() && !contents_all_zero {
+            Self::check_cms_timestamp(&contents_bytes)
+        } else {
+            false
+        };
+
+        // LTV is considered enabled when:
+        // 1. There is revocation data available (either DSS with CRLs/OCSPs,
+        //    or CMS-embedded revocation data), AND
+        // 2. A signature timestamp is present (to anchor the validation time).
+        let has_revocation = (has_dss && (dss_crl_count > 0 || dss_ocsp_count > 0))
+            || has_cms_revocation_data;
+        let is_ltv_enabled = has_revocation && has_timestamp;
+
         Ok(ValidationResult {
             field_info,
             signer_name,
@@ -399,6 +445,14 @@ impl SignatureValidator {
             cms_signature_valid,
             certificates,
             certificate_chain_valid,
+            has_dss,
+            dss_crl_count,
+            dss_ocsp_count,
+            dss_cert_count,
+            has_vri,
+            has_cms_revocation_data,
+            has_timestamp,
+            is_ltv_enabled,
             errors,
         })
     }
@@ -543,6 +597,109 @@ impl SignatureValidator {
                 })
             })
             .collect()
+    }
+
+    /// Check for a DSS (Document Security Store) dictionary at the
+    /// document root level.  Returns `(has_dss, crl_count, ocsp_count,
+    /// cert_count, has_vri_for_this_sig)`.
+    ///
+    /// The VRI lookup uses the SHA-1 hash of the signature `Contents` value
+    /// (uppercase hex) as the key inside `DSS.VRI`, per PDF 2.0 spec
+    /// (ISO 32000-2 §12.8.4.3).
+    fn check_dss(
+        doc: &Document,
+        contents_bytes: &[u8],
+    ) -> (bool, usize, usize, usize, bool) {
+        let root_ref = match doc.trailer.get(b"Root").and_then(|o| o.as_reference()) {
+            Ok(r) => r,
+            Err(_) => return (false, 0, 0, 0, false),
+        };
+        let root_dict = match doc.get_object(root_ref).and_then(|o| o.as_dict()) {
+            Ok(d) => d,
+            Err(_) => return (false, 0, 0, 0, false),
+        };
+
+        if !root_dict.has(b"DSS") {
+            return (false, 0, 0, 0, false);
+        }
+
+        let dss_dict = match root_dict.get(b"DSS") {
+            Ok(Object::Dictionary(d)) => d.clone(),
+            Ok(Object::Reference(r)) => match doc.get_object(*r).and_then(|o| o.as_dict()) {
+                Ok(d) => d.clone(),
+                Err(_) => return (false, 0, 0, 0, false),
+            },
+            _ => return (false, 0, 0, 0, false),
+        };
+
+        let crl_count = dss_dict
+            .get(b"CRLs")
+            .ok()
+            .and_then(|o| o.as_array().ok())
+            .map_or(0, |a| a.len());
+        let ocsp_count = dss_dict
+            .get(b"OCSPs")
+            .ok()
+            .and_then(|o| o.as_array().ok())
+            .map_or(0, |a| a.len());
+        let cert_count = dss_dict
+            .get(b"Certs")
+            .ok()
+            .and_then(|o| o.as_array().ok())
+            .map_or(0, |a| a.len());
+
+        // Check VRI (Validation Related Information) for this signature.
+        // The key is the uppercase SHA-1 hex of the Contents value.
+        let has_vri = if !contents_bytes.is_empty() && dss_dict.has(b"VRI") {
+            use sha1::{Sha1, Digest as Sha1Digest};
+            let mut hasher = Sha1::new();
+            hasher.update(contents_bytes);
+            let sig_hash = hasher.finalize();
+            let vri_key = sig_hash
+                .iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<String>();
+
+            match dss_dict.get(b"VRI") {
+                Ok(Object::Dictionary(vri_dict)) => vri_dict.has(vri_key.as_bytes()),
+                Ok(Object::Reference(r)) => {
+                    doc.get_object(*r)
+                        .and_then(|o| o.as_dict())
+                        .map_or(false, |d| d.has(vri_key.as_bytes()))
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+
+        (true, crl_count, ocsp_count, cert_count, has_vri)
+    }
+
+    /// Check whether the CMS `SignedData` contains an
+    /// `adbe-revocationInfoArchival` signed attribute
+    /// (OID 1.2.840.113583.1.1.8) which embeds CRL/OCSP data.
+    fn check_cms_revocation_data(cms_der: &[u8]) -> bool {
+        // DER encoding of OID 1.2.840.113583.1.1.8
+        let oid_pattern: &[u8] = &[
+            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x2f, 0x01, 0x01, 0x08,
+        ];
+        cms_der
+            .windows(oid_pattern.len())
+            .any(|w| w == oid_pattern)
+    }
+
+    /// Check whether the CMS `SignedData` contains a signature timestamp
+    /// (OID 1.2.840.113549.1.9.16.2.14 — id-smime-aa-signatureTimeStampToken).
+    fn check_cms_timestamp(cms_der: &[u8]) -> bool {
+        // DER encoding of OID 1.2.840.113549.1.9.16.2.14
+        let oid_pattern: &[u8] = &[
+            0x06, 0x0b, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10,
+            0x02, 0x0e,
+        ];
+        cms_der
+            .windows(oid_pattern.len())
+            .any(|w| w == oid_pattern)
     }
 
     /// Simple chain consistency check: for each cert[i] (except the last),

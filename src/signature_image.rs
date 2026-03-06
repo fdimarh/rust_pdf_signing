@@ -4,6 +4,7 @@ use crate::pdf_object::PdfObjectDeref;
 use crate::rectangle::Rectangle;
 use crate::user_signature_info::{UserFormSignatureInfo, UserSignatureInfo};
 use crate::{InsertImage, PDFSigningDocument, SignatureOptions};
+use base64::Engine;
 use lopdf::ObjectId;
 use std::collections::HashMap;
 
@@ -35,7 +36,7 @@ impl PDFSigningDocument {
         }
         let encoded_data = encoded_data.unwrap();
         // Decode data (from base64 to Vec<u8>)
-        let decoded_data = match base64::decode(encoded_data) {
+        let decoded_data = match base64::engine::general_purpose::STANDARD.decode(encoded_data) {
             Ok(decoded_data) => decoded_data,
             Err(err) => {
                 log::warn!(

@@ -61,6 +61,50 @@ fn print_result(r: &ValidationResult, index: usize) {
     );
     println!();
 
+    // LTV (Long-Term Validation)
+    println!(
+        "  LTV enabled:        {}",
+        if r.is_ltv_enabled {
+            "yes ✅"
+        } else {
+            "NO ❌"
+        }
+    );
+    println!(
+        "  Has timestamp:      {}",
+        if r.has_timestamp { "yes ✅" } else { "no ❌" }
+    );
+    println!(
+        "  DSS dictionary:     {}",
+        if r.has_dss {
+            format!(
+                "present (CRLs: {}, OCSPs: {}, Certs: {})",
+                r.dss_crl_count, r.dss_ocsp_count, r.dss_cert_count
+            )
+        } else {
+            "not present".to_string()
+        }
+    );
+    println!(
+        "  DSS VRI entry:      {}",
+        if r.has_vri {
+            "present ✅"
+        } else if r.has_dss {
+            "not found for this signature"
+        } else {
+            "N/A (no DSS)"
+        }
+    );
+    println!(
+        "  CMS revocation:     {}",
+        if r.has_cms_revocation_data {
+            "embedded (adbe-revocationInfoArchival) ✅"
+        } else {
+            "not embedded"
+        }
+    );
+    println!();
+
     // Certificates
     println!("  Certificates ({}):", r.certificates.len());
     for (i, c) in r.certificates.iter().enumerate() {

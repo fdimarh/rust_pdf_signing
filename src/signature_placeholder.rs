@@ -2,10 +2,14 @@
 //! `ByteRange`/`Contents`). These helpers are crate-private and intended to be used by
 //! the signing flow (for example from `signature_info.rs` or `digitally_sign.rs`).
 
-use crate::{Error, PDFSigningDocument, SignatureOptions, UserSignatureInfo};
-use crate::rectangle::Rectangle;
+use crate::{Error, SignatureOptions, UserSignatureInfo};
 use chrono::Utc;
 use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
+
+#[cfg(test)]
+use crate::PDFSigningDocument;
+#[cfg(test)]
+use crate::rectangle::Rectangle;
 
 // ---------------------------------------------------------------------------
 // Page-tree helpers
@@ -61,6 +65,7 @@ pub(crate) fn find_page_object_id(
 }
 
 /// Default rectangle used when `signature_rect` is not specified.
+#[cfg(test)]
 fn default_signature_rect() -> Rectangle {
     Rectangle { x1: 50.0, y1: 50.0, x2: 250.0, y2: 100.0 }
 }
@@ -145,6 +150,7 @@ pub(crate) fn build_signature_v_dictionary(
 /// Insert the provided `v_dictionary` into the new incremental document and set the
 /// `V` entry on the signature field `signature_obj_id` to reference the new object.
 /// Returns the object id of the newly inserted `V` dictionary.
+#[cfg(test)]
 pub(crate) fn insert_signature_v_object(
     pdf: &mut PDFSigningDocument,
     signature_obj_id: ObjectId,
@@ -172,7 +178,6 @@ pub(crate) fn insert_signature_v_object(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rectangle::Rectangle;
     use crate::image_insert::InsertImage;
     use crate::user_signature_info::UserSignatureInfo;
     use cryptographic_message_syntax::SignerBuilder;
