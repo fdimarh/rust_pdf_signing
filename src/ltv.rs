@@ -338,3 +338,182 @@ pub(crate) fn append_dss_dictionary(
 
     return Ok(buffer);
 }
+
+/// Request an RFC 3161 timestamp token from a TSA server.
+///
+/// The `message_digest` should be the SHA-256 hash of the data to be
+/// timestamped.  Returns the DER-encoded `TimeStampToken` (a CMS
+/// `ContentInfo` containing the TSA's response).
+pub(crate) fn fetch_timestamp_token(
+    tsa_url: &str,
+    message_digest: &[u8],
+) -> Result<Vec<u8>, Error> {
+
+    // Build a minimal RFC 3161 TimeStampReq using raw DER construction.
+    //
+    // TimeStampReq ::= SEQUENCE {
+    //   version          INTEGER  { v1(1) },
+    //   messageImprint   MessageImprint,
+    //   certReq          BOOLEAN  DEFAULT FALSE
+    // }
+    //
+    // MessageImprint ::= SEQUENCE {
+    //   hashAlgorithm    AlgorithmIdentifier (SHA-256),
+    //   hashedMessage    OCTET STRING
+    // }
+
+    // OID for SHA-256: 2.16.840.1.101.3.4.2.1
+    let sha256_oid_der: Vec<u8> = vec![
+        0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+    ];
+
+    // AlgorithmIdentifier = SEQUENCE { OID, NULL }
+    let mut alg_id = Vec::new();
+    let mut alg_content = Vec::new();
+    alg_content.extend_from_slice(&sha256_oid_der);
+    alg_content.push(0x05); // NULL tag
+    alg_content.push(0x00); // NULL length
+    alg_id.push(0x30); // SEQUENCE
+    der_push_length(&mut alg_id, alg_content.len());
+    alg_id.extend_from_slice(&alg_content);
+
+    // hashedMessage = OCTET STRING
+    let mut hashed_msg = Vec::new();
+    hashed_msg.push(0x04); // OCTET STRING
+    der_push_length(&mut hashed_msg, message_digest.len());
+    hashed_msg.extend_from_slice(message_digest);
+
+    // MessageImprint = SEQUENCE { AlgorithmIdentifier, OCTET STRING }
+    let mut msg_imprint = Vec::new();
+    let mut msg_imprint_content = Vec::new();
+    msg_imprint_content.extend_from_slice(&alg_id);
+    msg_imprint_content.extend_from_slice(&hashed_msg);
+    msg_imprint.push(0x30); // SEQUENCE
+    der_push_length(&mut msg_imprint, msg_imprint_content.len());
+    msg_imprint.extend_from_slice(&msg_imprint_content);
+
+    // version = INTEGER 1
+    let version_der: Vec<u8> = vec![0x02, 0x01, 0x01];
+
+    // certReq = BOOLEAN TRUE
+    let cert_req_der: Vec<u8> = vec![0x01, 0x01, 0xff];
+
+    // TimeStampReq = SEQUENCE { version, messageImprint, certReq }
+    let mut ts_req_content = Vec::new();
+    ts_req_content.extend_from_slice(&version_der);
+    ts_req_content.extend_from_slice(&msg_imprint);
+    ts_req_content.extend_from_slice(&cert_req_der);
+
+    let mut ts_req = Vec::new();
+    ts_req.push(0x30); // SEQUENCE
+    der_push_length(&mut ts_req, ts_req_content.len());
+    ts_req.extend_from_slice(&ts_req_content);
+
+    // Send to TSA
+    let client = Client::new();
+    let response = client
+        .post(tsa_url)
+        .header("Content-Type", "application/timestamp-query")
+        .body(ts_req)
+        .send()
+        .map_err(|e| Error::Other(format!("TSA request failed: {}", e)))?;
+
+    if !response.status().is_success() {
+        return Err(Error::Other(format!(
+            "TSA returned HTTP {}", response.status()
+        )));
+    }
+
+    let ts_resp = response
+        .bytes()
+        .map_err(|e| Error::Other(format!("Failed to read TSA response: {}", e)))?;
+
+    // Parse the TimeStampResp to extract the TimeStampToken.
+    // TimeStampResp ::= SEQUENCE {
+    //   status   PKIStatusInfo,
+    //   timeStampToken  TimeStampToken OPTIONAL
+    // }
+    //
+    // We do a minimal DER walk: skip the outer SEQUENCE, skip the
+    // PKIStatusInfo SEQUENCE, and the remainder is the TimeStampToken
+    // (a ContentInfo).
+
+    let data = ts_resp.to_vec();
+    if data.len() < 5 || data[0] != 0x30 {
+        return Err(Error::Other("Invalid TSA response: not a SEQUENCE".into()));
+    }
+
+    let (outer_content_start, _outer_len) = der_read_length(&data, 1)
+        .ok_or_else(|| Error::Other("Invalid TSA response: bad length".into()))?;
+
+    // First element: PKIStatusInfo (SEQUENCE)
+    let pos = outer_content_start;
+    if pos >= data.len() || data[pos] != 0x30 {
+        return Err(Error::Other("Invalid TSA response: missing PKIStatusInfo".into()));
+    }
+    let (status_content_start, status_len) = der_read_length(&data, pos + 1)
+        .ok_or_else(|| Error::Other("Invalid TSA response: bad PKIStatusInfo length".into()))?;
+
+    // Check status value (first element of PKIStatusInfo should be INTEGER 0 = granted)
+    if status_content_start < data.len() && data[status_content_start] == 0x02 {
+        let (val_start, val_len) = der_read_length(&data, status_content_start + 1)
+            .ok_or_else(|| Error::Other("Invalid TSA status".into()))?;
+        if val_len == 1 && val_start < data.len() && data[val_start] > 2 {
+            return Err(Error::Other(format!(
+                "TSA returned rejection status: {}", data[val_start]
+            )));
+        }
+    }
+
+    // Skip past PKIStatusInfo to get to TimeStampToken
+    let token_start = status_content_start + status_len;
+    if token_start >= data.len() {
+        return Err(Error::Other("TSA response contains no TimeStampToken".into()));
+    }
+
+    Ok(data[token_start..].to_vec())
+}
+
+/// Push a DER length encoding.
+fn der_push_length(buf: &mut Vec<u8>, len: usize) {
+    if len < 0x80 {
+        buf.push(len as u8);
+    } else if len <= 0xff {
+        buf.push(0x81);
+        buf.push(len as u8);
+    } else if len <= 0xffff {
+        buf.push(0x82);
+        buf.push((len >> 8) as u8);
+        buf.push(len as u8);
+    } else {
+        buf.push(0x83);
+        buf.push((len >> 16) as u8);
+        buf.push((len >> 8) as u8);
+        buf.push(len as u8);
+    }
+}
+
+/// Read a DER length at `offset`.  Returns `(content_start, length)`.
+fn der_read_length(data: &[u8], offset: usize) -> Option<(usize, usize)> {
+    if offset >= data.len() { return None; }
+    let first = data[offset] as usize;
+    if first < 0x80 {
+        Some((offset + 1, first))
+    } else if first == 0x81 {
+        if offset + 1 >= data.len() { return None; }
+        Some((offset + 2, data[offset + 1] as usize))
+    } else if first == 0x82 {
+        if offset + 2 >= data.len() { return None; }
+        let len = ((data[offset + 1] as usize) << 8) | (data[offset + 2] as usize);
+        Some((offset + 3, len))
+    } else if first == 0x83 {
+        if offset + 3 >= data.len() { return None; }
+        let len = ((data[offset + 1] as usize) << 16)
+            | ((data[offset + 2] as usize) << 8)
+            | (data[offset + 3] as usize);
+        Some((offset + 4, len))
+    } else {
+        None
+    }
+}
+

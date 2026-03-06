@@ -4,9 +4,14 @@ use std::process;
 
 fn print_result(r: &ValidationResult, index: usize) {
     let status = if r.is_valid() { "✅ VALID" } else { "❌ INVALID" };
+    let sig_type = if r.field_info.is_document_timestamp {
+        "Document Timestamp"
+    } else {
+        "Digital Signature"
+    };
 
     println!("─────────────────────────────────────────────");
-    println!("Signature #{}: {}", index + 1, status);
+    println!("Signature #{}: {} ({})", index + 1, status, sig_type);
     println!("─────────────────────────────────────────────");
     println!(
         "  Signer:             {}",

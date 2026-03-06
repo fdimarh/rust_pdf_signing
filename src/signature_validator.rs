@@ -35,6 +35,8 @@ pub struct SignatureFieldInfo {
     pub field_object_id: (u32, u16),
     /// Object‐id of the `V` (signature value) dictionary.
     pub value_object_id: (u32, u16),
+    /// `true` when the V dictionary has `/Type /DocTimeStamp` (PAdES B-LTA).
+    pub is_document_timestamp: bool,
 }
 
 /// Detailed result for one digital signature.
@@ -225,10 +227,20 @@ impl SignatureValidator {
                     _ => None,
                 });
 
+            // Check if this is a DocTimeStamp by inspecting the V dictionary
+            let is_document_timestamp = doc
+                .get_object(v_ref)
+                .and_then(|o| o.as_dict())
+                .ok()
+                .and_then(|vd| vd.get(b"Type").ok())
+                .and_then(|t| t.as_name_str().ok())
+                .map_or(false, |name| name == "DocTimeStamp");
+
             sig_fields.push(SignatureFieldInfo {
                 field_name,
                 field_object_id: f_ref,
                 value_object_id: v_ref,
+                is_document_timestamp,
             });
         }
 
@@ -313,9 +325,28 @@ impl SignatureValidator {
         let mut cms_signature_valid = false;
         let mut certificates: Vec<CertificateInfo> = Vec::new();
         let mut certificate_chain_valid = false;
+        let is_doc_timestamp = field_info.is_document_timestamp;
 
         if !contents_bytes.is_empty() && !contents_all_zero {
-            match SignedData::parse_ber(&contents_bytes) {
+            // For DocTimeStamp, the Contents is an RFC 3161 timestamp token
+            // wrapped in a ContentInfo.  We try multiple parsing strategies:
+            // 1. Parse directly (works if the library accepts ContentInfo)
+            // 2. Extract the inner SignedData from the ContentInfo wrapper
+            let cms_parse_result = if is_doc_timestamp {
+                // Strip trailing zeros from the contents (hex padding)
+                let trimmed = Self::trim_trailing_zeros(&contents_bytes);
+                SignedData::parse_ber(trimmed)
+                    .or_else(|_| {
+                        // Try extracting inner SignedData from ContentInfo
+                        Self::extract_signed_data_from_content_info(trimmed)
+                            .map(|inner| SignedData::parse_ber(&inner))
+                            .unwrap_or_else(|| SignedData::parse_ber(trimmed))
+                    })
+            } else {
+                SignedData::parse_ber(&contents_bytes)
+            };
+
+            match cms_parse_result {
                 Ok(signed_data) => {
                     // Extract certificates from CMS
                     certificates = Self::extract_certificates(&signed_data);
@@ -327,17 +358,6 @@ impl SignatureValidator {
                         errors.push("One or more certificates have expired".into());
                     }
 
-                    // Verify each CMS signer.
-                    //
-                    // `verify_signature_with_signed_data` internally:
-                    //   1. re-computes the digest over the signed attributes,
-                    //   2. verifies that the RSA/ECDSA signature on those
-                    //      attributes is valid for the signer's certificate,
-                    //   3. checks the embedded messageDigest attribute.
-                    //
-                    // If it succeeds the CMS envelope is intact.  We still
-                    // need to compare the messageDigest with the file digest
-                    // we computed from the ByteRange ourselves.
                     let signers: Vec<_> = signed_data.signers().collect();
                     if signers.is_empty() {
                         errors.push("CMS SignedData contains no signers".into());
@@ -355,39 +375,64 @@ impl SignatureValidator {
                                 }
                             }
 
-                            // ── messageDigest vs. file digest ──────
-                            // The messageDigest signed attribute is the
-                            // SHA-256 hash that the signer committed to.
-                            // We extract it from the raw DER of the
-                            // SignerInfo's signed attributes.
+                            // ── digest verification ────────────────
                             if !computed_digest.is_empty() {
-                                match Self::extract_message_digest_from_signer_der(
-                                    &contents_bytes,
-                                ) {
-                                    Some(embedded_digest) => {
-                                        if embedded_digest == computed_digest {
-                                            digest_match = true;
-                                        } else {
-                                            errors.push(
-                                                "CMS messageDigest does not match \
-                                                 computed file digest"
-                                                    .into(),
-                                            );
+                                if is_doc_timestamp {
+                                    // For timestamp tokens, extract messageImprint
+                                    // hash from TSTInfo (inside the encapContentInfo)
+                                    let trimmed = Self::trim_trailing_zeros(&contents_bytes);
+                                    match Self::extract_timestamp_imprint_hash(trimmed) {
+                                        Some(imprint_hash) => {
+                                            if imprint_hash == computed_digest {
+                                                digest_match = true;
+                                            } else {
+                                                errors.push(
+                                                    "Timestamp messageImprint does not match \
+                                                     computed file digest"
+                                                        .into(),
+                                                );
+                                            }
+                                        }
+                                        None => {
+                                            // Fall back: if CMS verification
+                                            // succeeded, trust the timestamp
+                                            if cms_signature_valid {
+                                                digest_match = true;
+                                            } else {
+                                                errors.push(
+                                                    "Could not extract messageImprint \
+                                                     from timestamp token"
+                                                        .into(),
+                                                );
+                                            }
                                         }
                                     }
-                                    None => {
-                                        // If we can't extract the attribute,
-                                        // fall back: if CMS verification
-                                        // succeeded the digest was checked
-                                        // internally by the library.
-                                        if cms_signature_valid {
-                                            digest_match = true;
-                                        } else {
-                                            errors.push(
-                                                "Could not extract messageDigest \
-                                                 from CMS signed attributes"
-                                                    .into(),
-                                            );
+                                } else {
+                                    // Regular signature: check messageDigest
+                                    match Self::extract_message_digest_from_signer_der(
+                                        &contents_bytes,
+                                    ) {
+                                        Some(embedded_digest) => {
+                                            if embedded_digest == computed_digest {
+                                                digest_match = true;
+                                            } else {
+                                                errors.push(
+                                                    "CMS messageDigest does not match \
+                                                     computed file digest"
+                                                        .into(),
+                                                );
+                                            }
+                                        }
+                                        None => {
+                                            if cms_signature_valid {
+                                                digest_match = true;
+                                            } else {
+                                                errors.push(
+                                                    "Could not extract messageDigest \
+                                                     from CMS signed attributes"
+                                                        .into(),
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -464,6 +509,26 @@ impl SignatureValidator {
             Object::String(bytes, _) => String::from_utf8(bytes.clone()).ok(),
             _ => None,
         })
+    }
+
+    /// Trim trailing zero bytes from a DER-encoded blob.
+    /// PDF hex-string Contents are padded with zeros to fill the placeholder.
+    fn trim_trailing_zeros(data: &[u8]) -> &[u8] {
+        // Find the actual DER content length from the outer SEQUENCE tag
+        if data.len() < 2 || data[0] != 0x30 {
+            return data;
+        }
+        match Self::read_der_length(data, 1) {
+            Some((content_start, content_len)) => {
+                let total = content_start + content_len;
+                if total <= data.len() {
+                    &data[..total]
+                } else {
+                    data
+                }
+            }
+            None => data,
+        }
     }
 
     /// Compute SHA-256 over the byte ranges (everything except the hex
@@ -700,6 +765,89 @@ impl SignatureValidator {
         cms_der
             .windows(oid_pattern.len())
             .any(|w| w == oid_pattern)
+    }
+
+    /// Extract the inner `SignedData` from an RFC 3161 timestamp token
+    /// (which is a CMS `ContentInfo` wrapping a `SignedData`).
+    ///
+    /// ContentInfo ::= SEQUENCE {
+    ///   contentType   OID (1.2.840.113549.1.7.2 = id-signedData),
+    ///   content [0]   EXPLICIT SignedData
+    /// }
+    fn extract_signed_data_from_content_info(data: &[u8]) -> Option<Vec<u8>> {
+        if data.is_empty() || data[0] != 0x30 {
+            return None;
+        }
+        let (outer_start, _outer_len) = Self::read_der_length(data, 1)?;
+
+        // Skip the contentType OID
+        let pos = outer_start;
+        if pos >= data.len() || data[pos] != 0x06 {
+            return None;
+        }
+        let (oid_content_start, oid_len) = Self::read_der_length(data, pos + 1)?;
+        let after_oid = oid_content_start + oid_len;
+
+        // Next should be [0] EXPLICIT (tag 0xA0)
+        if after_oid >= data.len() || data[after_oid] != 0xA0 {
+            return None;
+        }
+        let (explicit_start, _explicit_len) = Self::read_der_length(data, after_oid + 1)?;
+
+        // The SignedData SEQUENCE starts here
+        if explicit_start < data.len() && data[explicit_start] == 0x30 {
+            Some(data[explicit_start..].to_vec())
+        } else {
+            None
+        }
+    }
+
+    /// Extract the `messageImprint` hash from a TSTInfo structure inside a
+    /// timestamp token's SignedData encapContentInfo.
+    ///
+    /// We search for the SHA-256 OID (2.16.840.1.101.3.4.2.1) followed by
+    /// an OCTET STRING of 32 bytes — this is the `hashedMessage` in the
+    /// `MessageImprint` within `TSTInfo`.
+    fn extract_timestamp_imprint_hash(signed_data_der: &[u8]) -> Option<Vec<u8>> {
+        // OID for SHA-256: 2.16.840.1.101.3.4.2.1
+        let sha256_oid: &[u8] = &[
+            0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+        ];
+
+        // Find the SHA-256 OID inside the encapsulated content (TSTInfo).
+        // After the AlgorithmIdentifier there should be an OCTET STRING
+        // with the 32-byte hash.
+        for i in 0..signed_data_der.len().saturating_sub(sha256_oid.len()) {
+            if &signed_data_der[i..i + sha256_oid.len()] == sha256_oid {
+                // After the OID, skip the NULL (05 00) in AlgorithmIdentifier
+                let mut pos = i + sha256_oid.len();
+                // Skip NULL if present
+                if pos + 1 < signed_data_der.len()
+                    && signed_data_der[pos] == 0x05
+                    && signed_data_der[pos + 1] == 0x00
+                {
+                    pos += 2;
+                }
+                // Skip the closing of the AlgorithmIdentifier SEQUENCE
+                // and look for the OCTET STRING (0x04) within a few bytes
+                for offset in 0..10 {
+                    let check = pos + offset;
+                    if check >= signed_data_der.len() {
+                        break;
+                    }
+                    if signed_data_der[check] == 0x04 {
+                        let (content_start, content_len) =
+                            Self::read_der_length(signed_data_der, check + 1)?;
+                        if content_len == 32 && content_start + 32 <= signed_data_der.len() {
+                            return Some(
+                                signed_data_der[content_start..content_start + 32].to_vec(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Simple chain consistency check: for each cert[i] (except the last),

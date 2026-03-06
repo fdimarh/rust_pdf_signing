@@ -1,4 +1,5 @@
 use cryptographic_message_syntax::SignerBuilder;
+use pdf_signing::signature_options::PadesLevel;
 use pdf_signing::signature_options::SignatureFormat::{PADES, PKCS7};
 use pdf_signing::{PDFSigningDocument, Rectangle, SignatureOptions, UserSignatureInfo};
 use std::{env, fs::File, io::Write, process};
@@ -14,6 +15,8 @@ Options:
   -k, --key <path>          Private key PEM          (default: examples/assets/keystore-local-key.pem)
   -i, --image <path>        Signature image PNG      (default: examples/assets/sig1.png)
   -f, --format <pkcs7|pades> Signature format        (default: pades)
+  -l, --level <b-b|b-t|b-lt|b-lta>
+                            PAdES conformance level  (default: b-t, only for pades)
   -p, --page <num>          Page number (1-based)    (default: 1)
   -r, --rect <x1,y1,x2,y2> Signature rectangle      (default: 50,50,250,100)
   --invisible               Invisible signature (no image)
@@ -22,8 +25,16 @@ Options:
   --reason <text>           Signing reason            (default: Digital Signature)
   -h, --help                Show this help
 
+PAdES Levels:
+  b-b    Basic — ESS-signing-certificate-v2 only, no timestamp
+  b-t    Timestamp — adds signature timestamp from TSA (default)
+  b-lt   Long-Term — adds DSS dictionary with CRL/OCSP for offline validation
+  b-lta  Long-Term Archival — adds document timestamp on top of B-LT
+
 Examples:
   sign_doc input.pdf
+  sign_doc input.pdf -f pades -l b-lt
+  sign_doc input.pdf -f pades -l b-lta --invisible
   sign_doc input.pdf -o signed.pdf -f pkcs7 --invisible
   sign_doc input.pdf -c my-cert.pem -k my-key.pem -p 2 -r 100,100,300,150"
     );
@@ -48,6 +59,7 @@ fn main() {
     let mut key_path = "examples/assets/keystore-local-key.pem".to_string();
     let mut image_path = "examples/assets/sig1.png".to_string();
     let mut format_str = "pades".to_string();
+    let mut level_str = "b-t".to_string();
     let mut page: u32 = 1;
     let mut rect = (50.0f64, 50.0f64, 250.0f64, 100.0f64);
     let mut visible = true;
@@ -77,6 +89,10 @@ fn main() {
             "-f" | "--format" => {
                 i += 1;
                 format_str = args.get(i).expect("Missing value for --format").to_lowercase();
+            }
+            "-l" | "--level" => {
+                i += 1;
+                level_str = args.get(i).expect("Missing value for --level").to_lowercase();
             }
             "-p" | "--page" => {
                 i += 1;
@@ -197,8 +213,20 @@ fn main() {
         }
     };
 
+    let pades_level = match level_str.as_str() {
+        "b-b" | "bb" => PadesLevel::B_B,
+        "b-t" | "bt" => PadesLevel::B_T,
+        "b-lt" | "blt" => PadesLevel::B_LT,
+        "b-lta" | "blta" => PadesLevel::B_LTA,
+        _ => {
+            eprintln!("Error: unknown PAdES level '{}' (use b-b, b-t, b-lt, or b-lta)", level_str);
+            process::exit(1);
+        }
+    };
+
     let mut opts: SignatureOptions = Default::default();
     opts.format = format;
+    opts.pades_level = pades_level;
     opts.signature_size = 40_000;
     opts.signature_page = Some(page);
     opts.signature_rect = Some(Rectangle {
@@ -216,6 +244,9 @@ fn main() {
     println!("  Input:    {}", input_path);
     println!("  Output:   {}", output);
     println!("  Format:   {}", format_str.to_uppercase());
+    if format_str == "pades" || format_str == "cades" {
+        println!("  Level:    PAdES {}", level_str.to_uppercase());
+    }
     println!("  Page:     {}", page);
     println!("  Visible:  {}", visible);
     if visible {

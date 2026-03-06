@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::ltv::{append_dss_dictionary, build_adbe_revocation_attribute};
-use crate::signature_options::SignatureOptions;
+use crate::signature_options::{PadesLevel, SignatureFormat, SignatureOptions};
 use crate::{ByteRange, PDFSigningDocument, UserSignatureInfo};
 use bcder::Mode::Der;
 use bcder::{encode::Values, Captured, OctetString};
@@ -98,19 +98,80 @@ impl PDFSigningDocument {
             vec![AttributeValue::new(signing_certificate_v2_value)],
         );
 
-        // Add adbe-revocationInfoArchival signed attribute
-        let adbe_revocation_data = build_adbe_revocation_attribute(
-            &user_certificate_chain,
-            signature_options.signed_attribute_include_crl,
-            signature_options.signed_attribute_include_ocsp,
-        );
-        if let Some((oid, values)) = adbe_revocation_data {
-            signer = signer.signed_attribute(oid, values);
+        // Determine whether to include CMS-embedded revocation data and
+        // signature timestamp based on the signature format and PAdES level.
+        let is_pades = signature_options.format == SignatureFormat::PADES;
+        let include_cms_revocation;
+        let include_timestamp;
+        let include_dss;
+
+        if is_pades {
+            match &signature_options.pades_level {
+                PadesLevel::B_B => {
+                    // Basic: no timestamp, no revocation data, no DSS
+                    include_cms_revocation = false;
+                    include_timestamp = false;
+                    include_dss = false;
+                }
+                PadesLevel::B_T => {
+                    // Timestamp: add signature timestamp, optionally CMS revocation
+                    include_cms_revocation = signature_options.signed_attribute_include_crl
+                        || signature_options.signed_attribute_include_ocsp;
+                    include_timestamp = true;
+                    include_dss = false;
+                }
+                PadesLevel::B_LT => {
+                    // Long-Term: timestamp + CMS revocation + DSS dictionary
+                    include_cms_revocation = true;
+                    include_timestamp = true;
+                    include_dss = true;
+                }
+                PadesLevel::B_LTA => {
+                    // Long-Term Archival: same as B-LT + document timestamp
+                    include_cms_revocation = true;
+                    include_timestamp = true;
+                    include_dss = true;
+                }
+            }
+        } else {
+            // PKCS7: use existing options directly
+            include_cms_revocation = signature_options.signed_attribute_include_crl
+                || signature_options.signed_attribute_include_ocsp;
+            include_timestamp = signature_options.timestamp_url.is_some();
+            include_dss = signature_options.include_dss;
         }
 
-        // Timestamp
-        if let Some(tsa_url) = &signature_options.timestamp_url {
-            signer = signer.time_stamp_url(tsa_url).unwrap()
+        // Add adbe-revocationInfoArchival signed attribute (CRL/OCSP in CMS)
+        if include_cms_revocation {
+            let crl_flag = if is_pades {
+                // For PAdES B-LT/B-LTA always fetch both; for B-T use user prefs
+                matches!(signature_options.pades_level, PadesLevel::B_LT | PadesLevel::B_LTA)
+                    || signature_options.signed_attribute_include_crl
+            } else {
+                signature_options.signed_attribute_include_crl
+            };
+            let ocsp_flag = if is_pades {
+                matches!(signature_options.pades_level, PadesLevel::B_LT | PadesLevel::B_LTA)
+                    || signature_options.signed_attribute_include_ocsp
+            } else {
+                signature_options.signed_attribute_include_ocsp
+            };
+
+            let adbe_revocation_data = build_adbe_revocation_attribute(
+                &user_certificate_chain,
+                crl_flag,
+                ocsp_flag,
+            );
+            if let Some((oid, values)) = adbe_revocation_data {
+                signer = signer.signed_attribute(oid, values);
+            }
+        }
+
+        // Signature timestamp (TSA)
+        if include_timestamp {
+            if let Some(tsa_url) = &signature_options.timestamp_url {
+                signer = signer.time_stamp_url(tsa_url).unwrap()
+            }
         }
 
         // create new vec without the content part
@@ -140,9 +201,165 @@ impl PDFSigningDocument {
         // Write signature to file
         let mut pdf_file_data = Self::set_content(pdf_file_data, signature, signature_options);
 
-        if signature_options.include_dss {
-            pdf_file_data = append_dss_dictionary(pdf_file_data, user_certificate_chain)?;
+        // Append DSS dictionary for B-LT and B-LTA levels (or when explicitly requested)
+        if include_dss {
+            pdf_file_data = append_dss_dictionary(pdf_file_data, user_certificate_chain.clone())?;
         }
+
+        // For B-LTA: add a document-level timestamp via an incremental update.
+        // This creates a second signature that timestamps the entire document
+        // (including the DSS) to protect against future algorithm compromise.
+        if is_pades && signature_options.pades_level == PadesLevel::B_LTA {
+            if let Some(tsa_url) = &signature_options.timestamp_url {
+                pdf_file_data = Self::append_document_timestamp(
+                    pdf_file_data,
+                    tsa_url,
+                    signature_options.signature_size,
+                )?;
+            }
+        }
+
+        Ok(pdf_file_data)
+    }
+
+    /// Append a document-level timestamp signature (PAdES B-LTA).
+    ///
+    /// This creates a new incremental update containing a `/Type /DocTimeStamp`
+    /// signature field.  The timestamp covers the entire document (including the
+    /// DSS dictionary appended in the B-LT step), protecting it against future
+    /// algorithm compromise.
+    ///
+    /// The timestamp is obtained from the RFC 3161 TSA at `tsa_url`.
+    fn append_document_timestamp(
+        pdf_bytes: Vec<u8>,
+        tsa_url: &str,
+        sig_size: usize,
+    ) -> Result<Vec<u8>, Error> {
+        use crate::ltv::fetch_timestamp_token;
+        use lopdf::{Dictionary, IncrementalDocument, Object, StringFormat};
+
+        let mut doc = IncrementalDocument::load_from(pdf_bytes.as_slice())?;
+        doc.new_document.version = "2.0".parse().unwrap();
+
+        let placeholder_size = sig_size;
+
+        // Build the document timestamp V dictionary with placeholder Contents
+        let v_dict = Dictionary::from_iter(vec![
+            ("Type", Object::Name(b"DocTimeStamp".to_vec())),
+            ("Filter", Object::Name(b"Adobe.PPKLite".to_vec())),
+            ("SubFilter", Object::Name(b"ETSI.RFC3161".to_vec())),
+            (
+                "ByteRange",
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Integer(10000),
+                    Object::Integer(20000),
+                    Object::Integer(10000),
+                ]),
+            ),
+            (
+                "Contents",
+                Object::String(
+                    vec![0u8; placeholder_size / 2],
+                    StringFormat::Hexadecimal,
+                ),
+            ),
+        ]);
+        let v_ref = doc.new_document.add_object(Object::Dictionary(v_dict));
+
+        // Build a merged field-widget for the timestamp
+        let ts_field_name = format!("DocTimestamp{}", rand::random::<u32>());
+        let ts_dict = Dictionary::from_iter(vec![
+            ("FT", Object::Name(b"Sig".to_vec())),
+            (
+                "T",
+                Object::String(ts_field_name.into_bytes(), StringFormat::Literal),
+            ),
+            ("V", Object::Reference(v_ref)),
+            ("Type", Object::Name(b"Annot".to_vec())),
+            ("Subtype", Object::Name(b"Widget".to_vec())),
+            (
+                "Rect",
+                Object::Array(vec![
+                    0i32.into(),
+                    0i32.into(),
+                    0i32.into(),
+                    0i32.into(),
+                ]),
+            ),
+            ("F", Object::Integer(6)), // Hidden + Print
+        ]);
+        let ts_field_ref = doc.new_document.add_object(Object::Dictionary(ts_dict));
+
+        // Add to AcroForm.Fields and set SigFlags
+        let root_id = doc
+            .get_prev_documents()
+            .trailer
+            .get(b"Root")?
+            .as_reference()?;
+        doc.opt_clone_object_to_new_document(root_id)?;
+
+        let root_dict = doc
+            .new_document
+            .get_object_mut(root_id)?
+            .as_dict_mut()?;
+
+        // Get or create AcroForm
+        let acro_ref = if root_dict.has(b"AcroForm") {
+            root_dict.get(b"AcroForm")?.as_reference()?
+        } else {
+            let acro = Dictionary::from_iter(vec![
+                ("Fields", Object::Array(vec![])),
+                ("SigFlags", Object::Integer(3)),
+            ]);
+            let r = doc.new_document.add_object(Object::Dictionary(acro));
+            let root_dict2 = doc.new_document.get_object_mut(root_id)?.as_dict_mut()?;
+            root_dict2.set("AcroForm", Object::Reference(r));
+            r
+        };
+
+        doc.opt_clone_object_to_new_document(acro_ref)?;
+        let acro_mut = doc
+            .new_document
+            .get_object_mut(acro_ref)?
+            .as_dict_mut()?;
+        if acro_mut.has(b"Fields") {
+            let mut fields = acro_mut.get(b"Fields")?.as_array()?.clone();
+            fields.push(Object::Reference(ts_field_ref));
+            acro_mut.set("Fields", Object::Array(fields));
+        } else {
+            acro_mut.set(
+                "Fields",
+                Object::Array(vec![Object::Reference(ts_field_ref)]),
+            );
+        }
+        acro_mut.set("SigFlags", Object::Integer(3));
+
+        // Write the incremental update (with placeholder Contents)
+        let mut pdf_file_data = Vec::new();
+        doc.save_to(&mut pdf_file_data)?;
+
+        // Now compute ByteRange and fill in the timestamp token
+        let sig_opts = SignatureOptions {
+            signature_size: placeholder_size,
+            ..Default::default()
+        };
+        let (byte_range, pdf_file_data) = Self::set_next_byte_range(pdf_file_data, &sig_opts);
+
+        let first_part = &pdf_file_data[byte_range.get_range(0)];
+        let second_part = &pdf_file_data[byte_range.get_range(1)];
+
+        // Hash the file data outside the Contents placeholder
+        let mut hasher = Sha256::new();
+        hasher.update(first_part);
+        hasher.update(second_part);
+        let file_hash = hasher.finalize().to_vec();
+
+        // Request a timestamp token from the TSA
+        let ts_token = fetch_timestamp_token(tsa_url, &file_hash)?;
+
+        // Write the timestamp token into Contents
+        let pdf_file_data = Self::set_content(pdf_file_data, ts_token, &sig_opts);
 
         Ok(pdf_file_data)
     }
