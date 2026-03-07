@@ -2136,6 +2136,11 @@ impl SignatureValidator {
                             "[Shadow] object stream added after signing".into(),
                         );
                     }
+                    // XRef stream — part of PDF incremental update mechanism.
+                    // Always permitted as it is structural, not content.
+                    if type_name == b"XRef" {
+                        return ObjectChange::Permitted("XRef stream (incremental update)".into());
+                    }
                 }
                 // DSS streams typically don't have /Type, just /Length
                 // Accept streams that have only Length/Filter/DecodeParms
