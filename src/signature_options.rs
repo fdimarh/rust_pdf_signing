@@ -49,6 +49,20 @@ impl std::fmt::Display for PadesLevel {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum SignatureAnchorMode {
+    /// Place the visible signature directly on top of the matched tag text.
+    Overlay,
+    /// Place the visible signature to the right side ("in front") of the matched tag text.
+    InFront,
+}
+
+impl Default for SignatureAnchorMode {
+    fn default() -> Self {
+        Self::InFront
+    }
+}
+
 #[derive(Clone)]
 pub struct SignatureOptions {
     pub format: SignatureFormat,
@@ -73,6 +87,24 @@ pub struct SignatureOptions {
     /// annotation on the page.  Set to `false` to create an invisible
     /// (cryptography-only) digital signature with no visual appearance.
     pub visible_signature: bool,
+
+    /// Optional text marker used to anchor visible signature placement.
+    ///
+    /// When set, the signer tries to locate this marker on the selected page
+    /// and derives a rectangle from `signature_anchor_width` / `signature_anchor_height`.
+    /// If the marker cannot be found, signing returns an error.
+    pub signature_anchor_tag: Option<String>,
+
+    /// Width of visible signature when `signature_anchor_tag` is used.
+    /// If unset, width is inferred from `signature_rect` or default rectangle.
+    pub signature_anchor_width: Option<f64>,
+
+    /// Height of visible signature when `signature_anchor_tag` is used.
+    /// If unset, height is inferred from `signature_rect` or default rectangle.
+    pub signature_anchor_height: Option<f64>,
+
+    /// Placement mode used with `signature_anchor_tag`.
+    pub signature_anchor_mode: SignatureAnchorMode,
 
     /// PAdES conformance level.  Only used when `format` is `PADES`.
     /// Defaults to `B_T` (timestamp level).
@@ -99,6 +131,10 @@ impl Default for SignatureOptions {
             signature_page: None,
             signature_rect: None,
             visible_signature: true,
+            signature_anchor_tag: None,
+            signature_anchor_width: None,
+            signature_anchor_height: None,
+            signature_anchor_mode: SignatureAnchorMode::InFront,
             pades_level: PadesLevel::B_T,
         }
     }

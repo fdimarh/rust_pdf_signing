@@ -112,6 +112,10 @@ cargo run --example sign_doc -- input.pdf [options]
 | `-l, --level <b-b\|b-t\|b-lt\|b-lta>` | PAdES conformance level | `b-t` |
 | `-p, --page <num>` | Page number (1-based) | `1` |
 | `-r, --rect <x1,y1,x2,y2>` | Signature rectangle | `50,50,250,100` |
+| `--tag <text>` | Anchor visible signature to matching text tag | — |
+| `--width <num>` | Visible signature width used with `--tag` | — |
+| `--height <num>` | Visible signature height used with `--tag` | — |
+| `--tag-mode <front\|overlay>` | Place signature in front of tag or overlay tag | `front` |
 | `--invisible` | Invisible signature (no image) | — |
 | `--name <name>` | Signer name | `Signer` |
 | `--reason <text>` | Signing reason | `Digital Signature` |
@@ -137,6 +141,9 @@ cargo run --example sign_doc -- document.pdf -c my-cert.pem -k my-key.pem -o sig
 # Multi-signature (sign the output of a previous signing)
 cargo run --example sign_doc -- document.pdf -o first.pdf --name Alice --invisible
 cargo run --example sign_doc -- first.pdf -o second.pdf --name Bob --invisible
+
+# Place visible signature in front of a marker tag with explicit width/height
+cargo run --example sign_doc -- document.pdf --tag "#SIGN_HERE" --width 180 --height 64 --tag-mode front
 ```
 
 ### Verify a Signed PDF

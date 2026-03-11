@@ -9,6 +9,7 @@ mod lopdf_utils;
 mod ltv;
 mod pdf_object;
 pub mod rectangle;
+mod signature_anchor;
 mod signature_image;
 mod signature_info;
 mod signature_placeholder;
@@ -25,6 +26,8 @@ use lopdf::{
     Document, IncrementalDocument, Object, ObjectId,
 };
 use pdf_object::PdfObjectDeref;
+use signature_anchor::resolve_rect_from_tag;
+use signature_options::SignatureAnchorMode;
 use std::collections::HashMap;
 use std::{fs::File, path::Path};
 
@@ -222,6 +225,26 @@ impl PDFSigningDocument {
         }
     }
 
+    /// Convenience API: sign a PDF without placeholder and anchor the visible
+    /// signature in front of a text tag, with explicit `width` and `height`.
+    pub fn sign_document_no_placeholder_visible_by_tag(
+        &mut self,
+        user_info: &UserSignatureInfo,
+        signature_options: &SignatureOptions,
+        tag: &str,
+        width: f64,
+        height: f64,
+    ) -> Result<Vec<u8>, Error> {
+        let mut options = signature_options.clone();
+        options.visible_signature = true;
+        options.signature_anchor_tag = Some(tag.to_owned());
+        options.signature_anchor_width = Some(width);
+        options.signature_anchor_height = Some(height);
+        options.signature_anchor_mode = SignatureAnchorMode::InFront;
+
+        self.sign_document_no_placeholder(user_info, &options)
+    }
+
     /// Digitally sign a PDF that does **not** contain a pre-existing empty signature
     /// placeholder.  A new signature field, widget annotation, and visible signature
     /// image are created from scratch and placed on the page selected by
@@ -242,18 +265,18 @@ impl PDFSigningDocument {
         use std::io::Cursor;
 
         self.raw_document.new_document.version = "1.5".parse().unwrap();
+        let prev_doc_bytes = self.raw_document.get_prev_documents_bytes().to_vec();
+        let prev_doc_snapshot = Document::load_mem(&prev_doc_bytes)?;
 
-        let prev = self.get_prev_document_ref();
-        let root_id = prev.trailer.get(b"Root")?.as_reference()?;
-
-        // Check whether AcroForm already exists
-        let acroform_opt: Option<ObjectId> = {
-            let root_prev = prev.get_object(root_id)?.as_dict()?;
-            if root_prev.has(b"AcroForm") {
+        let (root_id, acroform_opt): (ObjectId, Option<ObjectId>) = {
+            let root_id = prev_doc_snapshot.trailer.get(b"Root")?.as_reference()?;
+            let root_prev = prev_doc_snapshot.get_object(root_id)?.as_dict()?;
+            let acro_opt = if root_prev.has(b"AcroForm") {
                 Some(root_prev.get(b"AcroForm")?.as_reference()?)
             } else {
                 None
-            }
+            };
+            (root_id, acro_opt)
         };
 
         // Clone Root into new incremental update
@@ -263,10 +286,7 @@ impl PDFSigningDocument {
         let field_name = format!("Signature{}", rand::random::<u32>());
 
         // --- Resolve target page ---
-        let target_page_ref = {
-            let prev_doc = self.get_prev_document_ref();
-            find_page_object_id(prev_doc, signature_options.signature_page)?
-        };
+        let target_page_ref = find_page_object_id(&prev_doc_snapshot, signature_options.signature_page)?;
 
         // --- Build V (signature value) dictionary ---
         let v_obj = build_signature_v_dictionary(user_info, signature_options);
@@ -278,8 +298,27 @@ impl PDFSigningDocument {
         // format that Adobe Reader, Foxit, and most viewers expect.
         let sig_field_id = if signature_options.visible_signature {
             // ── Visible signature: image XObject + appearance ──
-            let rect = signature_options.signature_rect
-                .unwrap_or(rectangle::Rectangle { x1: 50.0, y1: 50.0, x2: 250.0, y2: 100.0 });
+            let default_rect = rectangle::Rectangle { x1: 50.0, y1: 50.0, x2: 250.0, y2: 100.0 };
+            let base_rect = signature_options.signature_rect.unwrap_or(default_rect);
+            let width = signature_options
+                .signature_anchor_width
+                .unwrap_or(base_rect.x2 - base_rect.x1);
+            let height = signature_options
+                .signature_anchor_height
+                .unwrap_or(base_rect.y2 - base_rect.y1);
+
+            let rect = if let Some(tag) = signature_options.signature_anchor_tag.as_deref() {
+                resolve_rect_from_tag(
+                    &prev_doc_snapshot,
+                    target_page_ref,
+                    tag,
+                    &signature_options.signature_anchor_mode,
+                    width,
+                    height,
+                )?
+            } else {
+                base_rect
+            };
 
             let image_name = format!("UserSignature{}", user_info.user_id);
             let image_object_id = self.add_image_as_form_xobject(
@@ -317,13 +356,12 @@ impl PDFSigningDocument {
             self.raw_document.opt_clone_object_to_new_document(target_page_ref)?;
 
             let merged_resources = {
-                let prev_doc = self.get_prev_document_ref();
-                let page_dict = prev_doc.get_object(target_page_ref)?.as_dict()?;
+                let page_dict = prev_doc_snapshot.get_object(target_page_ref)?.as_dict()?;
 
                 let mut res_dict = if page_dict.has(b"Resources") {
                     match page_dict.get(b"Resources")? {
                         Object::Dictionary(d) => d.clone(),
-                        Object::Reference(r) => prev_doc.get_object(*r)?.as_dict()?.clone(),
+                        Object::Reference(r) => prev_doc_snapshot.get_object(*r)?.as_dict()?.clone(),
                         _ => lopdf::Dictionary::new(),
                     }
                 } else {
@@ -333,7 +371,7 @@ impl PDFSigningDocument {
                 let mut xobj_sub = if res_dict.has(b"XObject") {
                     match res_dict.get(b"XObject")? {
                         Object::Dictionary(d) => d.clone(),
-                        Object::Reference(r) => prev_doc.get_object(*r)?.as_dict()?.clone(),
+                        Object::Reference(r) => prev_doc_snapshot.get_object(*r)?.as_dict()?.clone(),
                         _ => lopdf::Dictionary::new(),
                     }
                 } else {

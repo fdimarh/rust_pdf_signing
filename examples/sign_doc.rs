@@ -1,5 +1,5 @@
 use cryptographic_message_syntax::SignerBuilder;
-use pdf_signing::signature_options::PadesLevel;
+use pdf_signing::signature_options::{PadesLevel, SignatureAnchorMode};
 use pdf_signing::signature_options::SignatureFormat::{PADES, PKCS7};
 use pdf_signing::{PDFSigningDocument, Rectangle, SignatureOptions, UserSignatureInfo};
 use std::{env, fs::File, io::Write, process};
@@ -19,6 +19,10 @@ Options:
                             PAdES conformance level  (default: b-t, only for pades)
   -p, --page <num>          Page number (1-based)    (default: 1)
   -r, --rect <x1,y1,x2,y2> Signature rectangle      (default: 50,50,250,100)
+  --tag <text>              Anchor visible signature to this text tag
+  --width <num>             Signature width for --tag placement
+  --height <num>            Signature height for --tag placement
+  --tag-mode <front|overlay> Tag placement mode (default: front)
   --invisible               Invisible signature (no image)
   --name <name>             Signer name              (default: Signer)
   --email <email>           Signer email             (default: signer@example.com)
@@ -38,6 +42,7 @@ PAdES Levels:
 Examples:
   sign_doc input.pdf
   sign_doc input.pdf -f pades -l b-lt
+  sign_doc input.pdf --tag \"#SIGN_HERE\" --width 180 --height 64 --tag-mode front
   sign_doc input.pdf -f pades -l b-lta --invisible
   sign_doc input.pdf -o signed.pdf -f pkcs7 --invisible
   sign_doc input.pdf -c my-cert.pem -k my-key.pem -p 2 -r 100,100,300,150"
@@ -73,6 +78,10 @@ fn main() {
     let mut include_dss = false;
     let mut include_crl: Option<bool> = None; // None = use default per format
     let mut include_ocsp = false;
+    let mut anchor_tag: Option<String> = None;
+    let mut anchor_width: Option<f64> = None;
+    let mut anchor_height: Option<f64> = None;
+    let mut anchor_mode = SignatureAnchorMode::InFront;
 
     let mut i = 2;
     while i < args.len() {
@@ -123,6 +132,44 @@ fn main() {
                 }
                 rect = (parts[0], parts[1], parts[2], parts[3]);
             }
+            "--tag" => {
+                i += 1;
+                anchor_tag = Some(args.get(i).expect("Missing value for --tag").clone());
+            }
+            "--width" => {
+                i += 1;
+                anchor_width = Some(
+                    args.get(i)
+                        .expect("Missing value for --width")
+                        .parse()
+                        .expect("--width must be a number"),
+                );
+            }
+            "--height" => {
+                i += 1;
+                anchor_height = Some(
+                    args.get(i)
+                        .expect("Missing value for --height")
+                        .parse()
+                        .expect("--height must be a number"),
+                );
+            }
+            "--tag-mode" => {
+                i += 1;
+                anchor_mode = match args
+                    .get(i)
+                    .expect("Missing value for --tag-mode")
+                    .to_lowercase()
+                    .as_str()
+                {
+                    "front" | "in-front" | "in_front" => SignatureAnchorMode::InFront,
+                    "overlay" | "over" => SignatureAnchorMode::Overlay,
+                    _ => {
+                        eprintln!("Error: --tag-mode must be front or overlay");
+                        process::exit(1);
+                    }
+                }
+            }
             "--invisible" => {
                 visible = false;
             }
@@ -157,6 +204,16 @@ fn main() {
             }
         }
         i += 1;
+    }
+
+    if anchor_tag.is_some() && (!visible) {
+        eprintln!("Error: --tag can only be used with visible signatures");
+        process::exit(1);
+    }
+
+    if anchor_tag.is_some() && (anchor_width.is_none() || anchor_height.is_none()) {
+        eprintln!("Error: --tag requires both --width and --height");
+        process::exit(1);
     }
 
     // Default output path: <input>-signed.pdf
@@ -258,6 +315,10 @@ fn main() {
         y2: rect.3,
     });
     opts.visible_signature = visible;
+    opts.signature_anchor_tag = anchor_tag.clone();
+    opts.signature_anchor_width = anchor_width;
+    opts.signature_anchor_height = anchor_height;
+    opts.signature_anchor_mode = anchor_mode;
 
     // ── Print summary ──
     println!("══════════════════════════════════════════════");
@@ -276,6 +337,9 @@ fn main() {
             "  Rect:     ({}, {}, {}, {})",
             rect.0, rect.1, rect.2, rect.3
         );
+        if let Some(ref tag) = opts.signature_anchor_tag {
+            println!("  Anchor:   tag='{}', mode={:?}", tag, opts.signature_anchor_mode);
+        }
         println!("  Image:    {}", image_path);
     }
     println!("  Signer:   {}", signer_name);
