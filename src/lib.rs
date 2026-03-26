@@ -9,7 +9,7 @@ mod lopdf_utils;
 mod ltv;
 mod pdf_object;
 pub mod rectangle;
-mod signature_anchor;
+pub mod signature_anchor;
 mod signature_image;
 mod signature_info;
 mod signature_placeholder;
