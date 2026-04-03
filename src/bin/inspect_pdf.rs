@@ -200,20 +200,33 @@ fn inspect_pdf(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if !args.is_empty() {
+        // Inspect every path supplied on the command line
+        for path in &args {
+            if std::path::Path::new(path).exists() {
+                if let Err(e) = inspect_pdf(path) {
+                    println!("⚠  inspect_pdf({}) error: {}", path, e);
+                }
+            } else {
+                println!("File not found: {}", path);
+            }
+        }
+        return Ok(());
+    }
+
+    // ── default behaviour (no args) ──────────────────────────────────────
     let result_path = "examples/result.pdf";
     let pre_path = "examples/assets/sample-pre-sign.pdf";
     let signed_path = "examples/assets/sample-signed.pdf";
 
-    // Inspect result.pdf (from sign_doc example) first
     if std::path::Path::new(result_path).exists() {
         inspect_pdf(result_path)?;
     }
-
-    // Inspect pre-sign if available
     if std::path::Path::new(pre_path).exists() {
         inspect_pdf(pre_path)?;
     }
-    // Always inspect signed
     if std::path::Path::new(signed_path).exists() {
         inspect_pdf(signed_path)?;
     } else {
