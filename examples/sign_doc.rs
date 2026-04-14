@@ -13,7 +13,8 @@ Options:
   -o, --output <path>       Output file path         (default: <input>-signed.pdf)
   -c, --cert <path>         Certificate chain PEM    (default: examples/assets/keystore-local-chain.pem)
   -k, --key <path>          Private key PEM          (default: examples/assets/keystore-local-key.pem)
-  -i, --image <path>        Signature image PNG      (default: examples/assets/sig1.png)
+  -i, --image <path>        Signature image (PNG, JPEG, BMP, GIF, TIFF, WebP)
+                                             (default: examples/assets/sig1.png)
   -f, --format <pkcs7|pades> Signature format        (default: pades)
   -l, --level <b-b|b-t|b-lt|b-lta>
                             PAdES conformance level  (default: b-t, only for pades)

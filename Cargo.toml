@@ -33,6 +33,7 @@ x509-parser = "0.18.1"
 rasn-ocsp = "0.28.8"
 rasn-pkix = "0.28.8"
 rasn = "0.28.8"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "bmp", "gif", "tiff", "webp"] }
 
 [features]
 default = []
