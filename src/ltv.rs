@@ -8,6 +8,7 @@ use lopdf::{Dictionary, IncrementalDocument, Object, Stream};
 use rasn::ber::encode;
 use rasn::types::ObjectIdentifier;
 use rasn_ocsp::{CertId, Request, TbsRequest};
+#[cfg(feature = "default-http-client")]
 use reqwest::blocking::Client;
 use std::borrow::Cow;
 use std::io::Write;
@@ -56,6 +57,7 @@ pub(crate) fn get_ocsp_crl_url(
     return (ocsp_url, crl_url);
 }
 
+#[cfg(feature = "default-http-client")]
 pub(crate) fn fetch_ocsp_response(
     captured_cert: &CapturedX509Certificate,
     ocsp_url: String,
@@ -79,6 +81,14 @@ pub(crate) fn fetch_ocsp_response(
         eprintln!("OCSP request failed with status: {}", response.status());
         Ok(None)
     };
+}
+
+#[cfg(not(feature = "default-http-client"))]
+pub(crate) fn fetch_ocsp_response(
+    _captured_cert: &CapturedX509Certificate,
+    _ocsp_url: String,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    Ok(None)
 }
 
 pub(crate) fn create_ocsp_request(
@@ -118,21 +128,27 @@ pub(crate) fn create_ocsp_request(
     Ok(encode(&ocsp_req).unwrap())
 }
 
+#[cfg(feature = "default-http-client")]
 pub(crate) fn fetch_crl_response(
     crl_url: String,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
     let client = Client::new();
-    //println!("{}", crl_url);
     let response = client.get(&crl_url).send().unwrap();
 
     if response.status().is_success() {
         let crl_resp = response.bytes()?;
-        //print!("{:?}", crl_resp);
         return Ok(Some(crl_resp.to_vec()));
     } else {
         eprintln!("CRL request failed with status: {}", response.status());
         return Ok(None);
     }
+}
+
+#[cfg(not(feature = "default-http-client"))]
+pub(crate) fn fetch_crl_response(
+    _crl_url: String,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    Ok(None)
 }
 
 pub struct CrlReponse {
@@ -231,23 +247,21 @@ pub(crate) fn fetch_revocation_data(
 
         if include_ocsp {
             if let Some(ocsp) = ocsp_url {
-                let cert_ocsp_data = fetch_ocsp_response(cert, ocsp);
-                if cert_ocsp_data.is_ok() {
-                    ocsp_data.push(cert_ocsp_data.unwrap().unwrap());
+                if let Ok(Some(bytes)) = fetch_ocsp_response(cert, ocsp) {
+                    ocsp_data.push(bytes);
                 }
             }
         }
         if include_crl {
             if let Some(crl) = crl_url {
-                let cert_crl_data = fetch_crl_response(crl).unwrap();
-                if cert_crl_data.is_some() {
-                    crl_data.push(cert_crl_data.unwrap());
+                if let Ok(Some(bytes)) = fetch_crl_response(crl) {
+                    crl_data.push(bytes);
                 }
             }
         }
     }
 
-    return (crl_data, ocsp_data);
+    (crl_data, ocsp_data)
 }
 
 pub(crate) fn build_adbe_revocation_attribute(
@@ -657,6 +671,7 @@ pub(crate) fn append_dss_dictionary(
 /// The `message_digest` should be the SHA-256 hash of the data to be
 /// timestamped.  Returns the DER-encoded `TimeStampToken` (a CMS
 /// `ContentInfo` containing the TSA's response).
+#[cfg(feature = "default-http-client")]
 pub(crate) fn fetch_timestamp_token(
     tsa_url: &str,
     message_digest: &[u8],
@@ -785,6 +800,16 @@ pub(crate) fn fetch_timestamp_token(
     }
 
     Ok(data[token_start..].to_vec())
+}
+
+#[cfg(not(feature = "default-http-client"))]
+pub(crate) fn fetch_timestamp_token(
+    _tsa_url: &str,
+    _message_digest: &[u8],
+) -> Result<Vec<u8>, Error> {
+    Err(Error::Other(
+        "timestamp HTTP client is disabled for this target/feature set".to_string(),
+    ))
 }
 
 /// Push a DER length encoding.

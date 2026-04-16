@@ -423,6 +423,48 @@ The test suite includes:
 - **Security attack defenses** (USF ByteRange validation, SWA detection, ISA content stream tampering, EAA annotation filtering)
 - **Encrypted PDF verification** (correct password, wrong password, no password, owner-only auto-decrypt)
 
+## WebAssembly (WASM) Support
+
+This library is compatible with WebAssembly targets. It uses pure Rust crypto (no OpenSSL or system dependencies).
+
+### Building for WASM
+
+**Prerequisites:**
+```bash
+rustup target add wasm32-unknown-unknown
+```
+
+**Build for WASM:**
+```bash
+cargo build --target wasm32-unknown-unknown --features=web
+```
+
+**Check WASM compatibility (without building):**
+```bash
+cargo check --target wasm32-unknown-unknown --features=web
+```
+
+### Random Number Generation in WASM
+
+This library uses a hybrid approach for random number generation:
+
+**Field Name Generation (Non-Security):**
+- **Desktop/Mobile**: True randomness via `rand` crate
+- **WASM**: Deterministic counter-based generation (atomic incrementing)
+- **Rationale**: PDF field names (e.g., `Signature0`, `DocTimestamp1`) are internal identifiers, not cryptographic secrets. Deterministic generation is safe and enables WASM support without entropy requirements.
+
+**Cryptographic Operations (Security):**
+- **Desktop/Mobile**: System entropy via `getrandom`
+- **WASM**: JavaScript entropy via `getrandom` with `js` feature and `wasm-bindgen`
+- **Rationale**: Cryptographic operations require true entropy. The `getrandom` crate with `js` feature bridges to JavaScript's `crypto.getRandomValues()` API.
+
+### WASM Integration Examples
+
+See [`INTEGRATION_GUIDE.md`](INTEGRATION_GUIDE.md) for detailed integration instructions with web frameworks like:
+- React / TypeScript (via `wasm-pack`)
+- Web Workers (for CPU-intensive operations)
+- Browser APIs (Fetch, IndexedDB)
+
 ## Dependencies
 
 | Crate | Purpose |
