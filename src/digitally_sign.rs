@@ -338,9 +338,19 @@ impl PDFSigningDocument {
             .get_object_mut(root_id)?
             .as_dict_mut()?;
 
-        // Get or create AcroForm
+        // Get or create AcroForm (handles both Reference and inline Dictionary)
         let acro_ref = if root_dict.has(b"AcroForm") {
-            root_dict.get(b"AcroForm")?.as_reference()?
+            let acro_obj = root_dict.get(b"AcroForm")?;
+            match acro_obj {
+                Object::Reference(r) => *r,
+                _ => {
+                    let obj = acro_obj.clone();
+                    let r = doc.new_document.add_object(obj);
+                    let root_mut = doc.new_document.get_object_mut(root_id)?.as_dict_mut()?;
+                    root_mut.set("AcroForm", Object::Reference(r));
+                    r
+                }
+            }
         } else {
             let acro = Dictionary::from_iter(vec![
                 ("Fields", Object::Array(vec![])),

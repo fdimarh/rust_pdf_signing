@@ -272,7 +272,7 @@ impl PDFSigningDocument {
             let root_id = prev_doc_snapshot.trailer.get(b"Root")?.as_reference()?;
             let root_prev = prev_doc_snapshot.get_object(root_id)?.as_dict()?;
             let acro_opt = if root_prev.has(b"AcroForm") {
-                Some(root_prev.get(b"AcroForm")?.as_reference()?)
+                root_prev.get(b"AcroForm")?.get_object_id()
             } else {
                 None
             };

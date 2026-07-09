@@ -1,3 +1,4 @@
+use crate::pdf_object::PdfObjectDeref;
 use crate::signature_options::SignatureFormat;
 use crate::{error::Error, UserSignatureInfo};
 use crate::{PDFSigningDocument, SignatureOptions};
@@ -15,12 +16,13 @@ impl PDFSigningDocument {
         signature_options: &SignatureOptions,
     ) -> Result<(), Error> {
         use lopdf::{Object::*, StringFormat};
-        let _root_obj_id = self
+        let _root_dict = self
             .raw_document
             .get_prev_documents()
             .trailer
             .get(b"Root")?
-            .as_reference()?;
+            .deref(&self.raw_document.get_prev_documents())?
+            .as_dict()?;
 
         // Update Annot to include image
         // Update `AP` in `Kids`
@@ -50,7 +52,9 @@ impl PDFSigningDocument {
             Some(list) => {
                 let mut new_list = vec![];
                 for obj in list {
-                    new_list.push(obj.as_reference()?);
+                    if let Ok(r) = obj.as_reference() {
+                        new_list.push(r);
+                    }
                 }
                 Some(new_list)
             }

@@ -4,18 +4,27 @@ fn hex_sample(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<String>>().join("")
 }
 
+/// Resolve an Object to a Dictionary, whether it's an indirect Reference or inline.
+fn resolve_dict<'a>(obj: &'a Object, doc: &'a Document) -> Result<&'a lopdf::Dictionary, Box<dyn std::error::Error>> {
+    match obj {
+        Object::Reference(oid) => doc.get_object(*oid)?.as_dict().map_err(Into::into),
+        _ => obj.as_dict().map_err(Into::into),
+    }
+}
+
 fn inspect_pdf(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n========== Loading {} ==========", path);
     let doc = Document::load(path)?;
-    let root = doc.trailer.get(b"Root")?.as_reference()?;
+    let root_obj = doc.trailer.get(b"Root")?;
+    let root = match root_obj {
+        Object::Reference(oid) => { println!("Root object id: {:?}", oid); *oid }
+        _ => { println!("Root is an inline dictionary"); return Ok(()); }
+    };
     let root_dict = doc.get_object(root)?.as_dict()?;
-    println!("Root object id: {:?}", root);
 
     // --- AcroForm ---
     if root_dict.has(b"AcroForm") {
-        let acro_ref = root_dict.get(b"AcroForm")?.as_reference()?;
-        println!("AcroForm object id: {:?}", acro_ref);
-        let acro = doc.get_object(acro_ref)?.as_dict()?;
+        let acro = resolve_dict(root_dict.get(b"AcroForm")?, &doc)?;
         // Print SigFlags
         if acro.has(b"SigFlags") {
             println!("AcroForm SigFlags: {:?}", acro.get(b"SigFlags")?);
@@ -41,9 +50,7 @@ fn inspect_pdf(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         if fdict.has(b"V") {
-                            let vref = fdict.get(b"V")?.as_reference()?;
-                            println!("  V ref: {:?}", vref);
-                            let vdict = doc.get_object(vref)?.as_dict()?;
+                            let vdict = resolve_dict(fdict.get(b"V")?, &doc)?;
                             println!("  V dict keys:");
                             for (k, v) in vdict.iter() {
                                 let key_str = String::from_utf8_lossy(&k);
@@ -84,8 +91,7 @@ fn inspect_pdf(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Pages ---
     if root_dict.has(b"Pages") {
-        let pages_ref = root_dict.get(b"Pages")?.as_reference()?;
-        let pages = doc.get_object(pages_ref)?.as_dict()?;
+        let pages = resolve_dict(root_dict.get(b"Pages")?, &doc)?;
         if pages.has(b"Kids") {
             let kids = pages.get(b"Kids")?.as_array()?;
             println!("Total top-level page nodes: {}", kids.len());

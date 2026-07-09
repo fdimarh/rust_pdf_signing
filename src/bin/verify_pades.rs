@@ -7,6 +7,14 @@ use cryptographic_message_syntax::SignedData;
 use lopdf::{Document, Object};
 use sha2::{Digest, Sha256};
 
+/// Resolve an Object to a Dictionary, whether it's an indirect Reference or inline.
+fn resolve_dict<'a>(obj: &'a Object, doc: &'a Document) -> Result<&'a lopdf::Dictionary, Box<dyn std::error::Error>> {
+    match obj {
+        Object::Reference(oid) => doc.get_object(*oid)?.as_dict().map_err(Into::into),
+        _ => obj.as_dict().map_err(Into::into),
+    }
+}
+
 /// OID 1.2.840.113549.1.9.4  — id-messageDigest
 const OID_MESSAGE_DIGEST: &[u8] = &[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
 /// OID 1.2.840.113549.1.9.3  — id-contentType
@@ -49,10 +57,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let doc = Document::load_mem(&pdf_bytes)?;
 
     // ── Find the signature V dictionary ──
-    let root_ref = doc.trailer.get(b"Root")?.as_reference()?;
-    let root_dict = doc.get_object(root_ref)?.as_dict()?;
-    let acro_ref = root_dict.get(b"AcroForm")?.as_reference()?;
-    let acro_dict = doc.get_object(acro_ref)?.as_dict()?;
+    let root_dict = resolve_dict(doc.trailer.get(b"Root")?, &doc)?;
+    let acro_dict = resolve_dict(root_dict.get(b"AcroForm")?, &doc)?;
 
     // Check SigFlags
     let sig_flags = acro_dict.get(b"SigFlags")
@@ -84,8 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", if is_merged { "yes ✅" } else { "no (separate objects)" });
 
         // Get V dictionary
-        let v_ref = f_dict.get(b"V")?.as_reference()?;
-        let v_dict = doc.get_object(v_ref)?.as_dict()?;
+        let v_dict = resolve_dict(f_dict.get(b"V")?, &doc)?;
 
         // ── PDF-level checks ──
         // SubFilter

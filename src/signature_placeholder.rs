@@ -2,6 +2,7 @@
 //! `ByteRange`/`Contents`). These helpers are crate-private and intended to be used by
 //! the signing flow (for example from `signature_info.rs` or `digitally_sign.rs`).
 
+use crate::pdf_object::PdfObjectDeref;
 use crate::{Error, SignatureOptions, UserSignatureInfo};
 use chrono::Utc;
 use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
@@ -40,10 +41,10 @@ pub(crate) fn find_page_object_id(
     doc: &Document,
     page_number: Option<u32>,
 ) -> Result<ObjectId, Error> {
-    let root_ref = doc.trailer.get(b"Root")?.as_reference()?;
-    let root_dict = doc.get_object(root_ref)?.as_dict()?;
-    let pages_ref = root_dict.get(b"Pages")?.as_reference()?;
-
+    let root_dict = doc.trailer.get(b"Root")?.deref(doc)?.as_dict()?;
+    let pages_obj = root_dict.get(b"Pages")?;
+    let pages_ref = pages_obj.get_object_id()
+        .ok_or_else(|| Error::Other("PDF contains no pages (Pages entry is not a reference)".into()))?;
     let all_pages = collect_leaf_pages(doc, pages_ref)?;
     if all_pages.is_empty() {
         return Err(Error::Other("PDF contains no pages".into()));

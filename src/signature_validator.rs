@@ -18,6 +18,7 @@
 //! }
 //! ```
 
+use crate::pdf_object::PdfObjectDeref;
 use crate::Error;
 use chrono::{DateTime, Utc, TimeZone};
 use cryptographic_message_syntax::SignedData;
@@ -238,7 +239,7 @@ impl SignatureValidator {
             })?;
         }
 
-        let fields = Self::find_signature_fields(&doc)?;
+        let fields = Self::find_signature_fields(&mut doc)?;
         if fields.is_empty() {
             return Err(Error::Other(
                 "No digital signature fields found in the PDF".into(),
@@ -376,20 +377,19 @@ impl SignatureValidator {
 
     // ── locate signature fields ────────────────────────────
 
-    fn find_signature_fields(doc: &Document) -> Result<Vec<SignatureFieldInfo>, Error> {
-        let root_ref = doc.trailer.get(b"Root")?.as_reference()?;
-        let root_dict = doc.get_object(root_ref)?.as_dict()?;
-
+    fn find_signature_fields(doc: &mut Document) -> Result<Vec<SignatureFieldInfo>, Error> {
+        // Clone dicts/arrays to avoid holding immutable borrows on doc
+        // when we later need to mutate doc.objects for inline V injection.
+        let root_dict = doc.trailer.get(b"Root")?.deref(doc)?.as_dict()?.clone();
         if !root_dict.has(b"AcroForm") {
             return Ok(vec![]);
         }
-        let acro_ref = root_dict.get(b"AcroForm")?.as_reference()?;
-        let acro_dict = doc.get_object(acro_ref)?.as_dict()?;
+        let acro_dict = root_dict.get(b"AcroForm")?.deref(doc)?.as_dict()?.clone();
         if !acro_dict.has(b"Fields") {
             return Ok(vec![]);
         }
 
-        let fields_arr = acro_dict.get(b"Fields")?.as_array()?;
+        let fields_arr = acro_dict.get(b"Fields")?.as_array()?.clone();
         let mut sig_fields = Vec::new();
 
         for f in fields_arr {
@@ -398,7 +398,7 @@ impl SignatureValidator {
                 Err(_) => continue,
             };
             let f_dict = match doc.get_object(f_ref).and_then(|o| o.as_dict()) {
-                Ok(d) => d,
+                Ok(d) => d.clone(),
                 Err(_) => continue,
             };
 
@@ -415,7 +415,7 @@ impl SignatureValidator {
             // DocTimeStamp where the field dict itself contains ByteRange/Contents.
             let (v_ref, is_document_timestamp) = match f_dict.get(b"V").and_then(|o| o.as_reference()) {
                 Ok(r) => {
-                    // Standard case: separate V dictionary
+                    // Standard case: separate V dictionary (indirect reference)
                     let v_dict_opt = doc
                         .get_object(r)
                         .and_then(|o| o.as_dict())
@@ -439,16 +439,42 @@ impl SignatureValidator {
                     (r, is_ts)
                 }
                 Err(_) => {
+                    // V may be an inline Dictionary (not a Reference)
+                    if let Some(v_dict) = f_dict.get(b"V").ok().and_then(|o| o.as_dict().ok()) {
+                        if v_dict.has(b"Contents") && v_dict.has(b"ByteRange") {
+                            let type_is_ts = v_dict
+                                .get(b"Type")
+                                .ok()
+                                .and_then(|t| t.as_name().ok())
+                                .map_or(false, |name| name == b"DocTimeStamp");
+                            let subfilter_is_ts = v_dict
+                                .get(b"SubFilter")
+                                .ok()
+                                .and_then(|t| t.as_name().ok())
+                                .map_or(false, |name| name == b"ETSI.RFC3161");
+                            let is_ts = type_is_ts || subfilter_is_ts;
+                            // Inject the inline V dict into the doc's object map
+                            // so validate_one can look it up by ObjectId.
+                            // f_dict is an owned clone, so no immutable borrow on doc
+                            let v_obj = f_dict.get(b"V")?.clone();
+                            let max_id = doc.objects.keys().max().copied().unwrap_or((0, 0));
+                            let new_id = (max_id.0 + 1, 0);
+                            doc.objects.insert(new_id, v_obj);
+                            (new_id, is_ts)
+                        } else {
+                            continue;
+                        }
+                    }
                     // Check if this is a merged DocTimeStamp field-widget-value dict:
-                    // the dict itself has /Type /DocTimeStamp, /Contents, /ByteRange
-                    let is_merged_ts = f_dict
+                    // the field dict itself has /Type /DocTimeStamp, /Contents, /ByteRange
+                    else if f_dict
                         .get(b"Type")
                         .and_then(|t| t.as_name())
                         .ok()
                         .map_or(false, |name| name == b"DocTimeStamp")
                         && f_dict.has(b"Contents")
-                        && f_dict.has(b"ByteRange");
-                    if is_merged_ts {
+                        && f_dict.has(b"ByteRange")
+                    {
                         // Use the field's own object ID as the V object ID
                         (f_ref, true)
                     } else {
