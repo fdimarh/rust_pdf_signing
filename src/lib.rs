@@ -1,6 +1,7 @@
 mod acro_form;
 mod byte_range;
 mod digitally_sign;
+pub mod encrypt_sign;
 mod error;
 mod image_insert;
 mod image_insert_to_page;

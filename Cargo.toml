@@ -17,6 +17,7 @@ log = "0.4.29"
 lopdf = { version = "0.39.0", features = [
     "chrono",
 ], default-features = false}
+rust-pdfbox = { path = "../rust-pdfbox", version = "*" }
 png = "0.18.1"
 rand = "0.9.1"
 sha2 = "0.10.8"
