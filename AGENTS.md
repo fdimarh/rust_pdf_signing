@@ -129,63 +129,31 @@ When the input PDF has an existing `/Encrypt` dictionary:
 3. **Re-Encrypt (Save):** Modify the `lopdf::Document::save_to` byte-writer. Apply the original AES/RC4 cipher to all objects **EXCEPT** the object ID representing the Signature Value (`/Contents`).
 
 ### 3. Skenario B: Adding a Password While Signing
-When the input PDF is unprotected but needs protection upon signing:
-1. Generate a new Encryption Dictionary (`/Encrypt`) with Owner/User passwords.
-2. Calculate the global encryption key.
-3. Inject the `/V` signature field.
-4. Encrypt all objects (excluding `/Contents`) while writing the byte stream.
-5. Compute the SHA-256 Hash of the *encrypted byte stream* (excluding the ByteRange gap).
-6. Generate CMS/PKCS#7 and inject it.
+When the input PDF is unprotected but needs protection upon signing, the process **MUST** follow the ISO 32000-1 Incremental Update specification for encrypted files.
 
-### SUCCESSFUL PROOF OF CONCEPT (ACHIEVED IN PREVIOUS SPRINT)
-We successfully verified that PDF Encrypted Signatures can be implemented using a **Custom Serializer Bypass**.
+**CRITICAL ARCHITECTURAL DECISION:**
+The `rust_pdf_signing` library (built on `lopdf`) **lacks the architectural capability** to properly serialize an encrypted PDF and then cleanly append an Incremental Update (TTE) without corrupting the ByteRange hash or the `xref` table. In-memory bypass hacks lead to Adobe Acrobat rejecting the signature due to `/Contents` corruption or byte offset mismatches.
 
-To recreate the password logic inside `digitally_sign.rs`, developers MUST use the `rust-pdfbox` AES/RC4 standard security handler, and inject this bypass algorithm precisely *before* `doc.save_to()`:
+**Solution:** **Migrate the Password-Protected TTE feature to `rust-pdfbox`!**
+The local `rust-pdfbox` library is vastly superior for this task because:
+1. It has full support for Advanced Cryptography (RC4, AES-128, AES-256 Rev 6).
+2. It natively understands Document Decryption (can load a password-protected PDF).
+3. It supports standard Java-like Save Pipelines for clean Incremental Updates.
 
-```rust
-// 1. Calculate Standard Security Handler Keys (MD5/RC4 ISO 32000-1)
-let o_value = compute_owner_password(user_pwd, owner_pwd);
-let file_key = compute_file_encryption_key(user_pwd, &o_value, permissions, file_id);
-let u_value = compute_user_password(&file_key, file_id);
+#### The `rust-pdfbox` Workflow Plan:
+1. **Phase 1 (Encryption):** Load the plaintext PDF using `rust-pdfbox`. Apply the `StandardSecurityHandler` (e.g., Owner/User password `admin123`). Serialize and save the encrypted PDF to a buffer. (The document is now legitimately locked).
+2. **Phase 2 (Decryption & Signing):** Load the encrypted buffer back into `rust-pdfbox`, passing the `admin123` password to unlock the parser. 
+3. **Phase 3 (Incremental Update):** Use `rust-pdfbox`'s native `sign_pdf` functionality to append the `/AcroForm` signature field and inject the CMS PKCS#7 hash. Save the result as an **Incremental Update** (appending new objects to the end of the file without touching the encrypted byte stream).
 
-// 2. Identify the Signature Object (e.g. ID 26)
-let mut bypass_ids = HashSet::new();
-bypass_ids.insert(sig_ref); // This is the /Contents placeholder
-
-// 3. Encrypt all OTHER objects manually using rust-pdfbox RC4
-for (&id, obj) in doc.objects.iter_mut() {
-    if bypass_ids.contains(&id) { continue; } // <--- THE BYPASS HACK
-    
-    match obj {
-        Object::String(ref mut s, _) => {
-            let obj_key = StandardSecurityHandler::compute_object_key(&file_key, id.0 as u32, id.1 as u16, false);
-            *s = rust_pdfbox::crypto::rc4::Rc4::crypt(&obj_key, s);
-        }
-        Object::Stream(ref mut stream) => {
-            let obj_key = StandardSecurityHandler::compute_object_key(&file_key, id.0 as u32, id.1 as u16, false);
-            stream.content = rust_pdfbox::crypto::rc4::Rc4::crypt(&obj_key, &stream.content);
-        }
-        _ => {} 
-    }
-}
-```
-
-### Required API Changes in `digitally_sign.rs`
-```rust
-pub struct SignOptions {
-    pub reason: String,
-    pub location: String,
-    pub contact_info: String,
-    pub signature_name: String,
-    // --- NEW ENCRYPTION FIELDS ---
-    pub input_password: Option<String>,
-    pub apply_new_password: Option<String>, // User password to set
-}
-```
+This guarantees 100% Adobe/Foxit compatibility, as the TTE Hex String is appended cleanly and the ByteRange remains mathematically accurate.
 
 ### Action Items for Next Sprint
 - [x] Port `rust-pdfbox` encryption logic to `rust_pdf_signing` (Achieved via `cargo add rust-pdfbox --path ...`).
-- [x] Override `lopdf`'s object serialization loop to skip the signature object ID during the encryption pass (Achieved via Custom Serializer Bypass).
-- [x] Write implementation Proof of Concept: `examples/sign_password.rs` (Outputs a valid RC4 ISO 32000 encrypted PDF with working AcroForm signature catalog).
+- [x] Override `lopdf`'s object serialization loop (Achieved via Custom Serializer Bypass - Proof of Concept).
+- [x] Write implementation Proof of Concept (`sign_password.rs`).
+- [x] **Feasibility Study Completed:** Concluded that `lopdf` writer architecture blocks Adobe-compliant Encrypted TTE.
+- [ ] **NEXT:** Transition the Password-TTE implementation fully to the `rust-pdfbox` repository.
+- [ ] **NEXT:** Implement Phase 1 (Encrypt & Save) in `rust-pdfbox`.
+- [ ] **NEXT:** Implement Phase 2 (Load Encrypted & Sign via Incremental Update) in `rust-pdfbox`.
 - [ ] Refactor `digitally_sign.rs` to inherently compute and bypass Signature Object IDs before writing ByteRange gap.
 - [ ] Implement robust `EncryptionState` integration inside the native `rust_pdf_signing` library struct API for full CMS certificate payload insertion.
