@@ -66,7 +66,33 @@ let user_info = UserSignatureInfo {
 };
 ```
 
-### Validating a Signed PDF
+## Password-Protected Signatures (Hybrid Architecture)
+
+This repository relies on `lopdf` for PDF parsing and writing. However, due to `lopdf`'s limitations regarding incremental serialization and byte-level encryption bypasses (required by ISO 32000-1 for Encrypted PAdES signatures), this library has integrated a **Hybrid Architecture** using `rust-pdfbox`.
+
+If you need to sign a password-protected PDF document, use the `encrypt_sign::sign_encrypted_pdf` bridge. This function delegates the cryptographic parsing and incremental append logic to `rust-pdfbox`, ensuring 100% Adobe Acrobat and Foxit Reader compliance.
+
+**Example Usage:**
+```rust
+use pdf_signing::encrypt_sign::sign_encrypted_pdf;
+
+// 1. Load the document password (e.g. "admin123")
+let password = Some("admin123");
+
+// 2. Sign via bridge
+let result = sign_encrypted_pdf(
+    &pdf_bytes,
+    &cert_pem,
+    &key_pem,
+    password,
+    "Signature1",
+)?;
+```
+See `examples/sign_password_bridge.rs` for a full implementation.
+
+## Validation of PAdES Signatures
+
+This crate includes a comprehensive validation module...
 
 ```rust
 use pdf_signing::signature_validator::{SignatureValidator, ValidationResult};
