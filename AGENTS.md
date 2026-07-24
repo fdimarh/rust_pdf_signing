@@ -51,3 +51,107 @@ cargo build
 cargo run --example verify_pdf "/path/to/document.pdf"
 cargo run --bin inspect_pdf "/path/to/document.pdf"
 ```
+
+---
+
+# CMS Signing Time Detection
+
+## Problem
+
+The `verify_pdf` tool displayed the PDF `/M` metadata field for signing time,
+but did not differentiate between PDF metadata (alterable) and the
+cryptographically protected CMS `id-signingTime` signed attribute.
+
+## Feature: `cms_has_signing_time`
+
+A new `bool` field on `ValidationResult` (in `signature_validator.rs`) that is
+`true` when the CMS `SignedData` contains the `id-signingTime` OID
+(`1.2.840.113549.1.9.5`) in its signed attributes.
+
+## Feature: `cms_timestamp_value`
+
+An `Option<String>` field on `ValidationResult` that contains the raw
+`genTime` value from the TSTInfo inside the RFC 3161 timestamp token
+(`id-smime-aa-signatureTimeStampToken` unsigned attribute). `None` when no
+timestamp token is present or the time cannot be extracted.
+
+### Detection Method
+
+Uses the same DER pattern-matching approach as `check_cms_timestamp`:
+
+```rust
+fn check_cms_signing_time(cms_der: &[u8]) -> bool {
+    let oid: &[u8] = &[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x05];
+    cms_der.windows(oid.len()).any(|w| w == oid)
+}
+```
+
+Timestamp value extraction finds the timestamp OID in the CMS DER then scans
+forward for the first `GeneralizedTime` (tag `0x18`):
+
+```rust
+fn extract_cms_timestamp_time(cms_der: &[u8]) -> Option<String> {
+    // ... finds OID 1.2.840.113549.1.9.16.2.14
+    // ... scans forward for tag 0x18, extracts the time string
+}
+```
+
+### Files modified
+
+| File | What |
+|------|------|
+| `src/signature_validator.rs` | Added `cms_has_signing_time` field + `check_cms_signing_time()` method + `cms_timestamp_value` field + `extract_cms_timestamp_time()` method |
+| `examples/verify_pdf.rs` | Added display + JSON fields for both `cms_has_signing_time` and `cms_timestamp_value` |
+
+---
+
+# ROADMAP: Password-Protected Digital Signatures (TTE Encrypted PDF)
+
+## Feature Overview
+Implement the ability to digitally sign PDFs that are password-protected (encrypted), as well as the ability to assign a password (protect) an unencrypted PDF at the exact moment of signing.
+
+## The Challenge (PDF Security vs Signing)
+According to ISO 32000, PDF Encryption (`/Encrypt`) affects streams and strings globally, **BUT** the digital signature dictionary (specifically the `/Contents` field holding the CMS PKCS#7 hex string) **MUST NOT** be encrypted. Otherwise, validators cannot read the signature without the password.
+
+Currently, `rust_pdf_signing` relies on `lopdf` `0.39` which has basic decryption but **lacks flexible stream-level encryption bypass mechanisms** needed for signature injection.
+
+## Implementation Plan (Opsi A: Pure Rust / Local Leverage)
+
+### 1. Module Extension: `crypto`
+Instead of rewriting complex AES/RC4 logic, we will adapt the modern cryptographic handlers recently built in the local `rust-pdfbox` project (`src/crypto/handlers.rs`).
+- Implement RC4 and AES-128 / AES-256 (Revision 5/6) encryption routines.
+- Port these into a new `src/encryption.rs` module in `rust_pdf_signing`.
+
+### 2. Skenario A: Signing an Already Encrypted PDF
+When the input PDF has an existing `/Encrypt` dictionary:
+1. **Decrypt (Load):** Use `lopdf::Document::decrypt(password)` to read the structure.
+2. **Inject Signature:** Create the `/V` signature field and placeholder.
+3. **Re-Encrypt (Save):** Modify the `lopdf::Document::save_to` byte-writer. Apply the original AES/RC4 cipher to all objects **EXCEPT** the object ID representing the Signature Value (`/Contents`).
+
+### 3. Skenario B: Adding a Password While Signing
+When the input PDF is unprotected but needs protection upon signing:
+1. Generate a new Encryption Dictionary (`/Encrypt`) with Owner/User passwords.
+2. Calculate the global encryption key.
+3. Inject the `/V` signature field.
+4. Encrypt all objects (excluding `/Contents`) while writing the byte stream.
+5. Compute the SHA-256 Hash of the *encrypted byte stream* (excluding the ByteRange gap).
+6. Generate CMS/PKCS#7 and inject it.
+
+### Required API Changes in `digitally_sign.rs`
+```rust
+pub struct SignOptions {
+    pub reason: String,
+    pub location: String,
+    pub contact_info: String,
+    pub signature_name: String,
+    // --- NEW ENCRYPTION FIELDS ---
+    pub input_password: Option<String>,
+    pub apply_new_password: Option<String>, // User password to set
+}
+```
+
+### Action Items for Next Sprint
+- [ ] Port `rust-pdfbox` encryption logic to `rust_pdf_signing`.
+- [ ] Override `lopdf`'s object serialization loop to skip the signature object ID during the encryption pass.
+- [ ] Write integration test: `test_sign_with_existing_password()`.
+- [ ] Write integration test: `test_sign_and_add_password()`.
