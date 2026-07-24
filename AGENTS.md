@@ -152,8 +152,7 @@ This guarantees 100% Adobe/Foxit compatibility, as the TTE Hex String is appende
 - [x] Override `lopdf`'s object serialization loop (Achieved via Custom Serializer Bypass - Proof of Concept).
 - [x] Write implementation Proof of Concept (`sign_password.rs`).
 - [x] **Feasibility Study Completed:** Concluded that `lopdf` writer architecture blocks Adobe-compliant Encrypted TTE.
-- [ ] **NEXT:** Transition the Password-TTE implementation fully to the `rust-pdfbox` repository.
-- [ ] **NEXT:** Implement Phase 1 (Encrypt & Save) in `rust-pdfbox`.
-- [ ] **NEXT:** Implement Phase 2 (Load Encrypted & Sign via Incremental Update) in `rust-pdfbox`.
-- [ ] Refactor `digitally_sign.rs` to inherently compute and bypass Signature Object IDs before writing ByteRange gap.
-- [ ] Implement robust `EncryptionState` integration inside the native `rust_pdf_signing` library struct API for full CMS certificate payload insertion.
+- [x] **ARCHITECTURAL SHIFT INITIATED:** Declared `rust-pdfbox` as the sole future engine for Encrypted TTE.
+- [ ] **MIGRATE WORKSPACE:** Switch active development directory to `rust-pdfbox`.
+- [ ] Read `MIGRATION_TTE_PLAN.md` located in the `rust-pdfbox` repository.
+- [ ] Begin Phase 1 of migration (Porting PKI/CMS logic to `rust-pdfbox/src/signing/`).
