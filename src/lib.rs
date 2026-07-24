@@ -530,3 +530,4 @@ impl InsertImageToPage for PDFSigningDocument {
             .add_to_page_content(page_id, content)?)
     }
 }
+pub mod encrypt_sign;

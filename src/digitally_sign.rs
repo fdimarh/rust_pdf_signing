@@ -62,6 +62,32 @@ impl PDFSigningDocument {
 
         // Convert pdf document to binary data.
         let mut pdf_file_data: Vec<u8> = Vec::new();
+        
+        // --- NEW ENCRYPTION PIPELINE ---
+        // At this exact point in digitally_sign_document, if the user requested password protection,
+        // we must encrypt everything BEFORE writing it out to calculate the ByteRange hash.
+        // We will mock the state injection here because `lopdf`'s EncryptionState requires raw passwords and permissions.
+        
+        /* 
+        // Example implementation when `SignOptions` is passed correctly:
+        if let Some(pwd) = &signature_options.apply_new_user_password {
+            use lopdf::encryption::EncryptionState;
+            // Build encryption state for User and Owner (empty owner defaults to user)
+            let permissions = lopdf::encryption::Permissions::default();
+            let mut state = EncryptionState::new(pwd.as_bytes(), b"owner123", permissions, "1.5");
+            
+            // Collect Signature object IDs to bypass
+            let mut bypass_ids = std::collections::HashSet::new();
+            // We would add `v_ref` (the Signature Dictionary ID) to `bypass_ids` here.
+            
+            let mut doc_clone = self.raw_document.clone();
+            crate::encrypt_sign::encrypt_document_with_bypass(&mut doc_clone.new_document, &state, &bypass_ids)?;
+            
+            doc_clone.save_to(&mut pdf_file_data)?;
+        } else {
+            self.write_document(&mut pdf_file_data)?;
+        }
+        */
         self.write_document(&mut pdf_file_data)?;
 
         let (byte_range, pdf_file_data) =
