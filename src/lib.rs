@@ -2,14 +2,18 @@ mod acro_form;
 mod byte_range;
 mod digitally_sign;
 mod error;
+#[cfg(feature = "image-support")]
 mod image_insert;
+#[cfg(feature = "image-support")]
 mod image_insert_to_page;
+#[cfg(feature = "image-support")]
 mod image_xobject;
 mod lopdf_utils;
 mod ltv;
 mod pdf_object;
 pub mod rectangle;
 pub mod signature_anchor;
+#[cfg(feature = "image-support")]
 mod signature_image;
 mod signature_info;
 mod signature_placeholder;
@@ -19,7 +23,9 @@ mod user_signature_info;
 
 use acro_form::AcroForm;
 use byte_range::ByteRange;
+#[cfg(feature = "image-support")]
 use image_insert::InsertImage;
+#[cfg(feature = "image-support")]
 use image_insert_to_page::InsertImageToPage;
 use lopdf::{
     content::{Content, Operation},

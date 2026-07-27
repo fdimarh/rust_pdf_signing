@@ -10,7 +10,8 @@ keywords = ["pdf", "signing"]
 categories = ["encoding", "graphics"]
 repository = "https://github.com/ralpha/pdf_signing"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
 log = "0.4.29"
@@ -33,15 +34,12 @@ x509-parser = "0.18.1"
 rasn-ocsp = "0.28.8"
 rasn-pkix = "0.28.8"
 rasn = "0.28.8"
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "bmp", "gif", "tiff", "webp"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "bmp", "gif", "tiff", "webp"], optional = true }
 
 [features]
-default = ["default-http-client"]
-default-http-client = ["reqwest", "cryptographic-message-syntax/http"]
-
-# Platform-specific features
-desktop = ["default-http-client"]
-mobile = ["default-http-client"]
-web = []
+default = ["network"]
+network = ["reqwest", "cryptographic-message-syntax/http"]
+image-support = ["dep:image"]
+cli = []
 
 debug = []
