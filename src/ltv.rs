@@ -8,7 +8,7 @@ use lopdf::{Dictionary, IncrementalDocument, Object, Stream};
 use rasn::ber::encode;
 use rasn::types::ObjectIdentifier;
 use rasn_ocsp::{CertId, Request, TbsRequest};
-#[cfg(feature = "default-http-client")]
+#[cfg(feature = "network")]
 use reqwest::blocking::Client;
 use std::borrow::Cow;
 use std::io::Write;
@@ -57,7 +57,7 @@ pub(crate) fn get_ocsp_crl_url(
     return (ocsp_url, crl_url);
 }
 
-#[cfg(feature = "default-http-client")]
+#[cfg(feature = "network")]
 pub(crate) fn fetch_ocsp_response(
     captured_cert: &CapturedX509Certificate,
     ocsp_url: String,
@@ -83,7 +83,7 @@ pub(crate) fn fetch_ocsp_response(
     };
 }
 
-#[cfg(not(feature = "default-http-client"))]
+#[cfg(not(feature = "network"))]
 pub(crate) fn fetch_ocsp_response(
     _captured_cert: &CapturedX509Certificate,
     _ocsp_url: String,
@@ -128,7 +128,7 @@ pub(crate) fn create_ocsp_request(
     Ok(encode(&ocsp_req).unwrap())
 }
 
-#[cfg(feature = "default-http-client")]
+#[cfg(feature = "network")]
 pub(crate) fn fetch_crl_response(
     crl_url: String,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
@@ -144,7 +144,7 @@ pub(crate) fn fetch_crl_response(
     }
 }
 
-#[cfg(not(feature = "default-http-client"))]
+#[cfg(not(feature = "network"))]
 pub(crate) fn fetch_crl_response(
     _crl_url: String,
 ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
@@ -671,7 +671,7 @@ pub(crate) fn append_dss_dictionary(
 /// The `message_digest` should be the SHA-256 hash of the data to be
 /// timestamped.  Returns the DER-encoded `TimeStampToken` (a CMS
 /// `ContentInfo` containing the TSA's response).
-#[cfg(feature = "default-http-client")]
+#[cfg(feature = "network")]
 pub(crate) fn fetch_timestamp_token(
     tsa_url: &str,
     message_digest: &[u8],
@@ -802,7 +802,7 @@ pub(crate) fn fetch_timestamp_token(
     Ok(data[token_start..].to_vec())
 }
 
-#[cfg(not(feature = "default-http-client"))]
+#[cfg(not(feature = "network"))]
 pub(crate) fn fetch_timestamp_token(
     _tsa_url: &str,
     _message_digest: &[u8],

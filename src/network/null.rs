@@ -1,6 +1,6 @@
 //! Null HTTP client implementation for platforms without network support
 //!
-//! This is used when the `default-http-client` feature is not enabled,
+//! This is used when the `network` feature is not enabled,
 //! or on platforms where network access is not available.
 
 use super::{HttpClient, HttpRequest, HttpResponse};
@@ -14,7 +14,7 @@ impl fmt::Display for NetworkDisabledError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Network operations are disabled. Enable the 'default-http-client' feature to use network operations."
+            "Network operations are disabled. Enable the 'network' feature to use network operations."
         )
     }
 }

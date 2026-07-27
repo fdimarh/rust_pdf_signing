@@ -84,11 +84,11 @@ pub trait HttpClient: Send + Sync {
 /// Get the default HTTP client for the current platform
 #[cfg(not(target_arch = "wasm32"))]
 pub fn create_default_client() -> Box<dyn HttpClient> {
-    #[cfg(feature = "default-http-client")]
+    #[cfg(feature = "network")]
     {
         Box::new(crate::network::desktop::ReqwestClient::new())
     }
-    #[cfg(not(feature = "default-http-client"))]
+    #[cfg(not(feature = "network"))]
     {
         Box::new(crate::network::null::NullHttpClient)
     }
@@ -101,7 +101,7 @@ pub fn create_default_client() -> Box<dyn HttpClient> {
 }
 
 /// Module for desktop implementation using reqwest
-#[cfg(all(not(target_arch = "wasm32"), feature = "default-http-client"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "network"))]
 pub mod desktop;
 
 /// Module for web implementation using fetch API
@@ -109,7 +109,7 @@ pub mod desktop;
 pub mod web;
 
 /// Null implementation for platforms without network support
-#[cfg(not(feature = "default-http-client"))]
+#[cfg(not(feature = "network"))]
 pub mod null;
 
 #[cfg(test)]
