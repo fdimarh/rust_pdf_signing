@@ -14,7 +14,7 @@ fn resolve_dict<'a>(obj: &'a Object, doc: &'a Document) -> Result<&'a lopdf::Dic
 
 fn inspect_pdf(path: &str, password: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n========== Loading {} ==========", path);
-    let mut doc = if let Some(pw) = password {
+    let doc = if let Some(pw) = password {
         Document::load_with_password(path, pw)?
     } else {
         let mut d = Document::load(path)?;

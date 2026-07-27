@@ -9,7 +9,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
 
 #[cfg(test)]
 use crate::PDFSigningDocument;
-#[cfg(test)]
+#[cfg(all(test, feature = "image-support"))]
 use crate::rectangle::Rectangle;
 
 // ---------------------------------------------------------------------------
@@ -66,7 +66,7 @@ pub(crate) fn find_page_object_id(
 }
 
 /// Default rectangle used when `signature_rect` is not specified.
-#[cfg(test)]
+#[cfg(all(test, feature = "image-support"))]
 fn default_signature_rect() -> Rectangle {
     Rectangle { x1: 50.0, y1: 50.0, x2: 250.0, y2: 100.0 }
 }
@@ -179,6 +179,7 @@ pub(crate) fn insert_signature_v_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "image-support")]
     use crate::image_insert::InsertImage;
     use crate::user_signature_info::UserSignatureInfo;
     use cryptographic_message_syntax::SignerBuilder;
@@ -186,6 +187,7 @@ mod tests {
     use x509_certificate::{CapturedX509Certificate, InMemorySigningKeyPair};
     use crate::acro_form::AcroForm;
     use lopdf::Object;
+    #[cfg(feature = "image-support")]
     use lopdf::Object::{Array, Name, Reference};
 
     #[test]
@@ -291,6 +293,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "image-support")]
     #[test]
     fn test_create_signature_field_and_insert_v_on_sample_pdf() -> Result<(), Box<dyn std::error::Error>> {
         use lopdf::{Dictionary as LoDictionary, Object as LoObject};

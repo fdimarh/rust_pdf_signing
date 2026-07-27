@@ -27,16 +27,17 @@ use byte_range::ByteRange;
 use image_insert::InsertImage;
 #[cfg(feature = "image-support")]
 use image_insert_to_page::InsertImageToPage;
+#[cfg(feature = "image-support")]
+use lopdf::content::{Content, Operation};
 use lopdf::{
-    content::{Content, Operation},
     Document, IncrementalDocument, Object, ObjectId,
 };
 use pdf_object::PdfObjectDeref;
+#[cfg(feature = "image-support")]
 use signature_anchor::resolve_rect_from_tag;
 use signature_options::SignatureAnchorMode;
 use std::collections::HashMap;
 use std::{fs::File, path::Path};
-
 pub use error::Error;
 pub use lopdf;
 pub use rectangle::Rectangle;
@@ -50,6 +51,7 @@ pub struct PDFSigningDocument {
     file_name: String,
     /// Link between the image name saved and the objectId of the image.
     /// This is used to reduce the amount of copies of the images in the pdf file.
+    #[allow(dead_code)]
     image_signature_object_id: HashMap<String, ObjectId>,
 
     acro_form: Option<Vec<AcroForm>>,
@@ -88,7 +90,7 @@ impl PDFSigningDocument {
     ) -> Result<Self, Error> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes)?;
-        let mut doc = if password.is_empty() {
+        let doc = if password.is_empty() {
             let mut d = Document::load_mem(&bytes)?;
             if d.is_encrypted() {
                 d.decrypt(password)
@@ -116,7 +118,7 @@ impl PDFSigningDocument {
         file_name: String,
     ) -> Result<Self, Error> {
         let bytes = std::fs::read(path.as_ref())?;
-        let mut doc = if password.is_empty() {
+        let doc = if password.is_empty() {
             let mut d = Document::load_mem(&bytes)?;
             if d.is_encrypted() {
                 d.decrypt(password)

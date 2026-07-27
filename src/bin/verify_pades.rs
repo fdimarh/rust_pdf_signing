@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("══════════════════════════════════════════════════════════\n");
 
     let pdf_bytes = std::fs::read(&path)?;
-    let mut doc = if let Some(pw) = pw_ref {
+    let doc = if let Some(pw) = pw_ref {
         if pw.is_empty() {
             let mut d = Document::load_mem(&pdf_bytes)?;
             if d.is_encrypted() {

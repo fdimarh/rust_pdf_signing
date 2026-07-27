@@ -7,6 +7,7 @@ use lopdf::ObjectId;
 
 impl PDFSigningDocument {
     // Change the signature to add extra info about the signing application
+    #[allow(dead_code)]
     pub(crate) fn add_general_info_to_signature(
         &mut self,
         signature_obj_id: ObjectId,

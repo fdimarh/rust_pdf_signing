@@ -3,7 +3,7 @@
 #![allow(unused_variables)] // TODO: remove, but requires implementing `InheritableFields`
 #![allow(dead_code)] // TODO: remove, but requires implementing `InheritableFields
 
-use crate::PdfObjectDeref;
+use crate::pdf_object::PdfObjectDeref;
 use crate::{lopdf_utils, Error};
 use lopdf::{Document, Object, ObjectId};
 
