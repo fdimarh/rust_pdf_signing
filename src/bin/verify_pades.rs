@@ -43,8 +43,47 @@ fn hex_preview(data: &[u8], max: usize) -> String {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let path = if args.len() > 1 {
-        args[1].clone()
+
+    // Parse --password <value> or --password=<value>
+    let mut password: Option<String> = None;
+    let mut skip_next = false;
+    for (i, arg) in args.iter().enumerate().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--password" || arg == "-P" {
+            if i + 1 < args.len() {
+                password = Some(args[i + 1].clone());
+                skip_next = true;
+            }
+        } else if let Some(val) = arg.strip_prefix("--password=") {
+            password = Some(val.to_string());
+        }
+    }
+
+    let pw_ref = password.as_deref();
+
+    // Collect file path
+    let mut files: Vec<String> = Vec::new();
+    let mut skip_val = false;
+    for arg in args.iter().skip(1) {
+        if skip_val {
+            skip_val = false;
+            continue;
+        }
+        if arg == "--password" || arg == "-P" {
+            skip_val = true;
+            continue;
+        }
+        if arg.starts_with("--password=") {
+            continue;
+        }
+        files.push(arg.clone());
+    }
+
+    let path = if !files.is_empty() {
+        files[0].clone()
     } else {
         "examples/result.pdf".to_string()
     };
@@ -54,7 +93,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("══════════════════════════════════════════════════════════\n");
 
     let pdf_bytes = std::fs::read(&path)?;
-    let doc = Document::load_mem(&pdf_bytes)?;
+    let mut doc = if let Some(pw) = pw_ref {
+        if pw.is_empty() {
+            let mut d = Document::load_mem(&pdf_bytes)?;
+            if d.is_encrypted() {
+                d.decrypt_raw(b"")?;
+            }
+            d
+        } else {
+            Document::load_mem_with_password(&pdf_bytes, pw)?
+        }
+    } else {
+        let mut d = Document::load_mem(&pdf_bytes)?;
+        if d.is_encrypted() {
+            d.decrypt_raw(b"")?;
+        }
+        d
+    };
 
     // ── Find the signature V dictionary ──
     let root_dict = resolve_dict(doc.trailer.get(b"Root")?, &doc)?;

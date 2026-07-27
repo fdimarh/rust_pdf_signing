@@ -4,7 +4,7 @@ use bcder::Mode::Der;
 use bcder::{encode::PrimitiveContent, Captured, Integer, Mode, OctetString, Oid, Tag};
 use cryptographic_message_syntax::Bytes;
 use lopdf::Object::Reference;
-use lopdf::{Dictionary, IncrementalDocument, Object, Stream};
+use lopdf::{Dictionary, IncrementalDocument, Object, Stream, Document};
 use rasn::ber::encode;
 use rasn::types::ObjectIdentifier;
 use rasn_ocsp::{CertId, Request, TbsRequest};
@@ -590,11 +590,26 @@ pub(crate) fn inject_unsigned_attribute_into_cms(
 pub(crate) fn append_dss_dictionary(
     pdf_bytes: Vec<u8>,
     user_certificate_chain: Vec<CapturedX509Certificate>,
+    password: Option<&str>,
 ) -> Result<Vec<u8>, Error> {
     //let mut file = std::fs::File::create("./signed.pdf").unwrap();
     //file.write_all(&pdf_bytes).unwrap();
 
-    let mut doc = IncrementalDocument::load_from(pdf_bytes.as_slice())?;
+    let mut doc = if let Some(pw) = password {
+        let d = if pw.is_empty() {
+            let mut d = Document::load_mem(&pdf_bytes)?;
+            if d.is_encrypted() {
+                d.decrypt(pw).map_err(|e| Error::Other(format!("Failed to decrypt PDF for DSS: {}", e)))?;
+            }
+            d
+        } else {
+            Document::load_mem_with_password(&pdf_bytes, pw)
+                .map_err(|e| Error::Other(format!("Failed to load encrypted PDF with password: {}", e)))?
+        };
+        IncrementalDocument::create_from(pdf_bytes, d)
+    } else {
+        IncrementalDocument::load_from(pdf_bytes.as_slice())?
+    };
     doc.new_document.version = "1.5".parse().unwrap();
 
     let (crl_data, ocsp_data) = fetch_revocation_data(&user_certificate_chain, true, true);

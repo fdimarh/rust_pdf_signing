@@ -53,6 +53,7 @@ pub struct PDFSigningDocument {
     image_signature_object_id: HashMap<String, ObjectId>,
 
     acro_form: Option<Vec<AcroForm>>,
+    password: Option<String>,
 }
 
 impl PDFSigningDocument {
@@ -62,6 +63,7 @@ impl PDFSigningDocument {
             file_name,
             image_signature_object_id: HashMap::new(),
             acro_form: None,
+            password: None,
         }
     }
 
@@ -71,6 +73,7 @@ impl PDFSigningDocument {
         // Do not replace `image_signature_object_id`
         // We want to keep this so we can do optimization.
         self.acro_form = other.acro_form;
+        self.password = other.password;
     }
 
     pub fn read_from<R: std::io::Read>(reader: R, file_name: String) -> Result<Self, Error> {
@@ -78,9 +81,56 @@ impl PDFSigningDocument {
         Ok(Self::new(raw_doc, file_name))
     }
 
+    pub fn read_from_with_password<R: std::io::Read>(
+        mut reader: R,
+        password: &str,
+        file_name: String,
+    ) -> Result<Self, Error> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        let mut doc = if password.is_empty() {
+            let mut d = Document::load_mem(&bytes)?;
+            if d.is_encrypted() {
+                d.decrypt(password)
+                    .map_err(|e| Error::Other(format!("Failed to decrypt PDF: {}", e)))?;
+            }
+            d
+        } else {
+            Document::load_mem_with_password(&bytes, password)
+                .map_err(|e| Error::Other(format!("Failed to load encrypted PDF with password: {}", e)))?
+        };
+        let incr_doc = IncrementalDocument::create_from(bytes, doc);
+        let mut result = Self::new(incr_doc, file_name);
+        result.password = Some(password.to_string());
+        Ok(result)
+    }
+
     pub fn read<P: AsRef<Path>>(path: P, file_name: String) -> Result<Self, Error> {
         let raw_doc = IncrementalDocument::load(path)?;
         Ok(Self::new(raw_doc, file_name))
+    }
+
+    pub fn read_with_password<P: AsRef<Path>>(
+        path: P,
+        password: &str,
+        file_name: String,
+    ) -> Result<Self, Error> {
+        let bytes = std::fs::read(path.as_ref())?;
+        let mut doc = if password.is_empty() {
+            let mut d = Document::load_mem(&bytes)?;
+            if d.is_encrypted() {
+                d.decrypt(password)
+                    .map_err(|e| Error::Other(format!("Failed to decrypt PDF: {}", e)))?;
+            }
+            d
+        } else {
+            Document::load_mem_with_password(&bytes, password)
+                .map_err(|e| Error::Other(format!("Failed to load encrypted PDF with password: {}", e)))?
+        };
+        let incr_doc = IncrementalDocument::create_from(bytes, doc);
+        let mut result = Self::new(incr_doc, file_name);
+        result.password = Some(password.to_string());
+        Ok(result)
     }
 
     pub fn load_all(&mut self) -> Result<(), Error> {
@@ -283,8 +333,7 @@ impl PDFSigningDocument {
         use std::io::Cursor;
 
         self.raw_document.new_document.version = "1.5".parse().unwrap();
-        let prev_doc_bytes = self.raw_document.get_prev_documents_bytes().to_vec();
-        let prev_doc_snapshot = Document::load_mem(&prev_doc_bytes)?;
+        let prev_doc_snapshot = self.raw_document.get_prev_documents().clone();
 
         let (root_id, acroform_opt): (ObjectId, Option<ObjectId>) = {
             let root_id = prev_doc_snapshot.trailer.get(b"Root")?.as_reference()?;

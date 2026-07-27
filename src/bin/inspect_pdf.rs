@@ -12,9 +12,18 @@ fn resolve_dict<'a>(obj: &'a Object, doc: &'a Document) -> Result<&'a lopdf::Dic
     }
 }
 
-fn inspect_pdf(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn inspect_pdf(path: &str, password: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n========== Loading {} ==========", path);
-    let doc = Document::load(path)?;
+    let mut doc = if let Some(pw) = password {
+        Document::load_with_password(path, pw)?
+    } else {
+        let mut d = Document::load(path)?;
+        if d.is_encrypted() {
+            d.decrypt_raw("")?;
+        }
+        d
+    };
+
     let root_obj = doc.trailer.get(b"Root")?;
     let root = match root_obj {
         Object::Reference(oid) => { println!("Root object id: {:?}", oid); *oid }
@@ -206,13 +215,51 @@ fn inspect_pdf(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args().collect();
 
-    if !args.is_empty() {
+    // Parse --password <value> or --password=<value>
+    let mut password: Option<String> = None;
+    let mut skip_next = false;
+    for (i, arg) in args.iter().enumerate().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--password" || arg == "-P" {
+            if i + 1 < args.len() {
+                password = Some(args[i + 1].clone());
+                skip_next = true;
+            }
+        } else if let Some(val) = arg.strip_prefix("--password=") {
+            password = Some(val.to_string());
+        }
+    }
+
+    let pw_ref = password.as_deref();
+
+    // Collect file paths
+    let mut files: Vec<String> = Vec::new();
+    let mut skip_val = false;
+    for arg in args.iter().skip(1) {
+        if skip_val {
+            skip_val = false;
+            continue;
+        }
+        if arg == "--password" || arg == "-P" {
+            skip_val = true;
+            continue;
+        }
+        if arg.starts_with("--password=") {
+            continue;
+        }
+        files.push(arg.clone());
+    }
+
+    if !files.is_empty() {
         // Inspect every path supplied on the command line
-        for path in &args {
+        for path in &files {
             if std::path::Path::new(path).exists() {
-                if let Err(e) = inspect_pdf(path) {
+                if let Err(e) = inspect_pdf(path, pw_ref) {
                     println!("⚠  inspect_pdf({}) error: {}", path, e);
                 }
             } else {
@@ -228,13 +275,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signed_path = "examples/assets/sample-signed.pdf";
 
     if std::path::Path::new(result_path).exists() {
-        inspect_pdf(result_path)?;
+        inspect_pdf(result_path, pw_ref)?;
     }
     if std::path::Path::new(pre_path).exists() {
-        inspect_pdf(pre_path)?;
+        inspect_pdf(pre_path, pw_ref)?;
     }
     if std::path::Path::new(signed_path).exists() {
-        inspect_pdf(signed_path)?;
+        inspect_pdf(signed_path, pw_ref)?;
     } else {
         println!("Signed PDF not found at {}", signed_path);
     }

@@ -211,7 +211,7 @@ impl PDFSigningDocument {
 
         // Append DSS dictionary for B-LT and B-LTA levels (or when explicitly requested)
         if include_dss {
-            pdf_file_data = append_dss_dictionary(pdf_file_data, user_certificate_chain.clone())?;
+            pdf_file_data = append_dss_dictionary(pdf_file_data, user_certificate_chain.clone(), self.password.as_deref())?;
         }
 
         // For B-LTA: add a document-level timestamp via an incremental update.
@@ -223,6 +223,7 @@ impl PDFSigningDocument {
                     pdf_file_data,
                     tsa_url,
                     signature_options.signature_size,
+                    self.password.as_deref(),
                 )?;
             }
         }
@@ -242,12 +243,27 @@ impl PDFSigningDocument {
         pdf_bytes: Vec<u8>,
         tsa_url: &str,
         sig_size: usize,
+        password: Option<&str>,
     ) -> Result<Vec<u8>, Error> {
         use crate::ltv::fetch_timestamp_token;
         use crate::signature_placeholder::find_page_object_id;
-        use lopdf::{Dictionary, IncrementalDocument, Object, StringFormat};
+        use lopdf::{Dictionary, IncrementalDocument, Object, StringFormat, Document};
 
-        let mut doc = IncrementalDocument::load_from(pdf_bytes.as_slice())?;
+        let mut doc = if let Some(pw) = password {
+            let d = if pw.is_empty() {
+                let mut d = Document::load_mem(&pdf_bytes)?;
+                if d.is_encrypted() {
+                    d.decrypt(pw).map_err(|e| Error::Other(format!("Failed to decrypt PDF for timestamping: {}", e)))?;
+                }
+                d
+            } else {
+                Document::load_mem_with_password(&pdf_bytes, pw)
+                    .map_err(|e| Error::Other(format!("Failed to load encrypted PDF with password: {}", e)))?
+            };
+            IncrementalDocument::create_from(pdf_bytes, d)
+        } else {
+            IncrementalDocument::load_from(pdf_bytes.as_slice())?
+        };
         doc.new_document.version = "2.0".parse().unwrap();
 
         let placeholder_size = sig_size;

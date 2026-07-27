@@ -214,30 +214,25 @@ impl SignatureValidator {
         pdf_bytes: &[u8],
         password: Option<&[u8]>,
     ) -> Result<Vec<ValidationResult>, Error> {
-        let mut doc = Document::load_mem(pdf_bytes)
-            .map_err(|e| Error::Other(format!("Failed to load PDF: {}", e)))?;
+        let mut doc = if let Some(pw) = password {
+            let pw_str = std::str::from_utf8(pw).unwrap_or("");
+            Document::load_mem_with_password(pdf_bytes, pw_str)
+                .map_err(|e| Error::Other(format!("Failed to decrypt PDF with password: {}", e)))?
+        } else {
+            let mut d = Document::load_mem(pdf_bytes)
+                .map_err(|e| Error::Other(format!("Failed to load PDF: {}", e)))?;
+            if d.is_encrypted() {
+                d.decrypt_raw(b"").map_err(|e| {
+                    Error::Other(format!(
+                        "PDF is encrypted. Provide a password with --password. Decryption error: {}",
+                        e
+                    ))
+                })?;
+            }
+            d
+        };
 
-        // Handle encrypted PDFs
-        // lopdf 0.39: is_encrypted() checks current state, was_encrypted()
-        // checks if the document was ever encrypted (including auto-decrypted)
         let was_encrypted = doc.is_encrypted() || doc.was_encrypted();
-        if doc.is_encrypted() {
-            let pw = password.unwrap_or(b"");
-            doc.decrypt_raw(pw).map_err(|e| {
-                if password.is_some() {
-                    Error::Other(format!(
-                        "Failed to decrypt PDF with the provided password: {}",
-                        e
-                    ))
-                } else {
-                    Error::Other(format!(
-                        "PDF is encrypted. Provide a password with --password. \
-                         Decryption error: {}",
-                        e
-                    ))
-                }
-            })?;
-        }
 
         let fields = Self::find_signature_fields(&mut doc)?;
         if fields.is_empty() {
@@ -248,7 +243,7 @@ impl SignatureValidator {
 
         let mut results = Vec::with_capacity(fields.len());
         for field_info in fields {
-            let mut result = Self::validate_one(pdf_bytes, &doc, field_info)?;
+            let mut result = Self::validate_one(pdf_bytes, &doc, field_info, was_encrypted)?;
             result.is_encrypted = was_encrypted;
             results.push(result);
         }
@@ -509,6 +504,7 @@ impl SignatureValidator {
         pdf_bytes: &[u8],
         doc: &Document,
         field_info: SignatureFieldInfo,
+        was_encrypted: bool,
     ) -> Result<ValidationResult, Error> {
         let mut errors: Vec<String> = Vec::new();
 
@@ -568,11 +564,25 @@ impl SignatureValidator {
         // warning only when a single-signature document fails this check.
 
         // ── extract Contents (the DER-encoded PKCS#7) ──────
-        let contents_bytes = match v_dict.get(b"Contents") {
-            Ok(Object::String(bytes, _)) => bytes.clone(),
-            _ => {
-                errors.push("Contents entry missing or not a string".into());
-                Vec::new()
+        let contents_bytes = if was_encrypted && byte_range.len() == 4 {
+            // For encrypted PDFs, /Contents in the parsed doc may be corrupted by lopdf's decrypt.
+            // Extract from raw bytes instead.
+            Self::extract_contents_from_byte_gap(pdf_bytes, &byte_range)
+                .unwrap_or_else(|| {
+                    // Fallback
+                    match v_dict.get(b"Contents") {
+                        Ok(Object::String(bytes, _)) => bytes.clone(),
+                        _ => Vec::new()
+                    }
+                })
+        } else {
+            // Non-encrypted: read from parsed object
+            match v_dict.get(b"Contents") {
+                Ok(Object::String(bytes, _)) => bytes.clone(),
+                _ => {
+                    errors.push("Contents entry missing or not a string".into());
+                    Vec::new()
+                }
             }
         };
 
@@ -833,6 +843,35 @@ impl SignatureValidator {
             hasher.update(&pdf_bytes[start1..start1 + len1]);
         }
         hasher.finalize().to_vec()
+    }
+
+    fn extract_contents_from_byte_gap(pdf_bytes: &[u8], byte_range: &[i64]) -> Option<Vec<u8>> {
+        if byte_range.len() != 4 {
+            return None;
+        }
+        let gap_start = (byte_range[0] + byte_range[1]) as usize;
+        let gap_end = byte_range[2] as usize;
+        if gap_end <= gap_start || gap_end > pdf_bytes.len() {
+            return None;
+        }
+
+        let gap = &pdf_bytes[gap_start..gap_end];
+
+        // Find hex content between < and >
+        let open = gap.iter().position(|&b| b == b'<')?;
+        let close = gap[open..].iter().position(|&b| b == b'>')?;
+        let hex_data = &gap[open + 1..open + close];
+
+        // Decode hex pairs to bytes
+        let mut decoded = Vec::with_capacity(hex_data.len() / 2);
+        for chunk in hex_data.chunks(2) {
+            if chunk.len() == 2 {
+                let hex_str = std::str::from_utf8(chunk).ok()?;
+                let byte = u8::from_str_radix(hex_str, 16).ok()?;
+                decoded.push(byte);
+            }
+        }
+        Some(decoded)
     }
 
     /// Extract the `messageDigest` OctetString value from the raw DER of
@@ -1822,12 +1861,16 @@ impl SignatureValidator {
         pdf_bytes: &[u8],
         password: Option<&[u8]>,
     ) -> Result<Document, lopdf::Error> {
-        let mut doc = Document::load_mem(pdf_bytes)?;
-        if doc.is_encrypted() {
-            let pw = password.unwrap_or(b"");
-            doc.decrypt_raw(pw)?;
+        if let Some(pw) = password {
+            let pw_str = std::str::from_utf8(pw).unwrap_or("");
+            Document::load_mem_with_password(pdf_bytes, pw_str)
+        } else {
+            let mut doc = Document::load_mem(pdf_bytes)?;
+            if doc.is_encrypted() {
+                doc.decrypt_raw(b"")?;
+            }
+            Ok(doc)
         }
-        Ok(doc)
     }
 
     /// For each signature, check whether subsequent revisions contain
